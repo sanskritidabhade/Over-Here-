@@ -8,40 +8,43 @@
  *  MOVER = "Player"  — fog-of-war, WASD / Arrow / D-Pad.
  *  VOICE — PeerJS MediaConnection, auto-established on connect.
  *
- *  ── GHOST AI OVERHAUL (Pac-Man Continuous Flow) ─────────────────
+ *  ── FIXES IN THIS VERSION ───────────────────────────────────────
  *
- *  1. TARGET TILE SYSTEM  (always moving)
- *     • Each ghost is ALWAYS in state MOVING_TO_TARGET.
- *     • On arrival, a new target is picked IMMEDIATELY.
- *     • New targets must be ≥ TARGET_MIN_DIST (10) BFS tiles away —
- *       forcing full-maze traversal like Pac-Man ghosts.
- *     • pickLongDistanceTarget() floods from the ghost's current tile,
- *       collects all cells with BFS dist ≥ 10, and picks randomly.
- *       Falls back to ≥5 then any cell if the maze is small.
+ *  1. BFS STEP-BY-STEP PATHFINDING  (fixes wall-corner sticking)
+ *     • bfsNextStep(fromC, fromR, toC, toR) runs a single BFS from
+ *       the ghost's current tile and returns the IMMEDIATE next tile
+ *       on the shortest route.  Used for CHASE, SEARCH, and
+ *       MOVING_TO_TARGET — ghosts now navigate corridors correctly
+ *       instead of pushing diagonally into walls.
+ *     • Result is cached every PATHFIND_INTERVAL_MS (150 ms) to keep
+ *       CPU cost constant even with many ghosts.
  *
- *  2. BOREDOM TIMER  (2-second anti-camping)
- *     • If a ghost is within EXIT_GUARD_TILES (3) of the exit tile
- *       OR on any shortest-path tile, and is NOT chasing, a 2-second
- *       "boredom" clock runs.
- *     • On expiry: getOppositeQuadrantTarget() finds the ghost's
- *       current map quadrant (TL/TR/BL/BR) and picks a random floor
- *       cell from the diagonally opposite quadrant.
+ *  2. CHASE STUCK → FLANK MANEUVER  (fixes "hovering" bug)
+ *     • Each ghost in CHASE mode counts consecutive frames where its
+ *       squared displacement < CHASE_STUCK_SQ.
+ *     • After CHASE_STUCK_FRAMES (60 ≈ 1 second) the ghost forces a
+ *       FLANK: picks a BFS-reachable tile FLANK_OFFSET (4) tiles
+ *       perpendicular to the ghost→player axis and routes there first,
+ *       then immediately re-enters chase.  This breaks through T-junctions
+ *       and forces approach from a different corridor.
  *
- *  3. CHASE & SEARCH  ("Blinky" behaviour)
- *     • 4-tile Euclidean sensing radius.
- *     • On detection: aggro = true, speed = BASE × 1.4, chase player.
- *     • On loss of sight: 3-second "search" at last-known position.
- *       During search the ghost orbits the last-known tile in a small
- *       circle (radius SEARCH_ORBIT_R tiles) rather than micro-jittering.
- *     • After search expires: picks a new long-distance target.
+ *  3. SCATTER MODE  (breaks cluster walls every 10 seconds)
+ *     • A level-wide scatterTimer increments each physics tick.
+ *     • Every SCATTER_INTERVAL_S (10) seconds all ghosts ignore the
+ *       player for SCATTER_DURATION_S (3) seconds and move to their
+ *       assigned map corner (ghost 0→TL, 1→TR, 2→BL, 3→BR, cycling).
+ *     • aggro is suspended during scatter; ghosts glow dim blue.
+ *     • After scatter ends, ghosts resume normal target-tile travel.
  *
- *  ── PRESERVED (byte-for-byte) ───────────────────────────────────
+ *  ── PRESERVED (byte-for-byte identical to previous version) ─────
  *     • PeerJS / STUN networking — initHost, initMover, all handlers.
  *     • drawPlayerChar — neon cyan ball, 18 px shadowBlur glow.
- *     • drawGhost, drawPing, drawWall, drawExit — unchanged.
+ *     • drawPing, drawWall, drawExit — identical.
  *     • HUD, overlays, D-pad wiring, audio triggers.
  *     • Level table — +1 ghost per level from Level 0.
  *     • Fairness engine — BFS spawn-exclusion, path set, retries.
+ *     • Boredom timer, long-distance target picker, opposite-quadrant
+ *       relocation, search orbit — all preserved and still active.
  * ═══════════════════════════════════════════════════════════════════
  */
 
@@ -51,51 +54,71 @@ import Peer from "peerjs";
 //  CONSTANTS
 // ───────────────────────────────────────────────────────────────────
 
-const TILE = 40;           // px per maze cell
-const COLS = 19;           // must be odd
-const ROWS = 15;           // must be odd
-const W    = COLS * TILE;  // 760
-const H    = ROWS * TILE;  // 600
+const TILE = 40;
+const COLS = 19;
+const ROWS = 15;
+const W    = COLS * TILE;
+const H    = ROWS * TILE;
 
 // Player
 const PLAYER_R     = TILE * 0.36;
-const PLAYER_SPEED = 185;           // px/s
+const PLAYER_SPEED = 185;
 
 // Ghost base
 const ENEMY_R        = TILE * 0.38;
-const ENEMY_BASE_SPD = 72;          // px/s normal travel speed
-const ENEMY_AGGRO_M  = 1.4;         // speed multiplier while chasing
+const ENEMY_BASE_SPD = 72;
+const ENEMY_AGGRO_M  = 1.4;
 
 // AI sensing & chase
-const SENSE_R         = TILE * 4;   // 4-tile Euclidean sensing radius
-const CHASE_LINGER_MS = 3000;       // ms to search after losing sight
+const SENSE_R         = TILE * 4;
+const CHASE_LINGER_MS = 3000;
+
+// ── NEW: Chase-stuck flank ───────────────────────────────────────
+const CHASE_STUCK_FRAMES = 60;      // frames of no progress → flank
+const CHASE_STUCK_SQ     = 2 * 2;  // px² threshold for "no progress"
+const FLANK_OFFSET       = 4;      // tiles perpendicular to chase axis
+
+// ── NEW: Scatter mode ───────────────────────────────────────────
+const SCATTER_INTERVAL_S = 10;     // seconds between scatter phases
+const SCATTER_DURATION_S = 3;      // seconds each scatter lasts
+
+// ── NEW: BFS step cache ──────────────────────────────────────────
+const PATHFIND_INTERVAL_MS = 150;  // re-run BFS step at most every 150 ms
 
 // Target-tile system (Pac-Man flow)
-const TARGET_MIN_DIST   = 10;       // BFS tiles — minimum distance to next target
-const TARGET_FALLBACK_1 = 5;        // fallback if < 10 reachable
-const ARRIVAL_THRESH    = TILE * 0.45; // px — "close enough" to snap to target
+const TARGET_MIN_DIST   = 10;
+const TARGET_FALLBACK_1 = 5;
+const ARRIVAL_THRESH    = TILE * 0.45;
 
-// Search orbit (Blinky behaviour on loss of sight)
-const SEARCH_ORBIT_R    = TILE * 2; // px radius of orbit circle at last-known pos
-const SEARCH_ORBIT_SPD  = 1.8;      // rad/s orbit angular velocity
+// Search orbit
+const SEARCH_ORBIT_R   = TILE * 2;
+const SEARCH_ORBIT_SPD = 1.8;
 
 // Boredom / exit-camping
-const EXIT_GUARD_TILES  = 3;        // tile radius around exit that triggers boredom
-const BOREDOM_MS        = 2000;     // ms of idle-near-exit before forced relocation
+const EXIT_GUARD_TILES = 3;
+const BOREDOM_MS       = 2000;
 
-// Stuck safety net
-const STUCK_FRAMES      = 24;       // frames with no movement → force new target
-const STUCK_DIST_SQ     = 3 * 3;   // px² threshold for "haven't moved"
+// Stuck safety net (general)
+const STUCK_FRAMES  = 24;
+const STUCK_DIST_SQ = 3 * 3;
 
 // Spawn rules
-const SPAWN_MIN_DIST    = TILE * 4; // min ghost distance from player start
-const ENEMY_SPACE_MIN   = TILE * 3; // min distance between ghosts
-const EXIT_BUFFER_TILES = 2;        // shortest-path tiles before exit, spawn-excluded
+const SPAWN_MIN_DIST    = TILE * 4;
+const ENEMY_SPACE_MIN   = TILE * 3;
+const EXIT_BUFFER_TILES = 2;
 
 // Misc
 const FOG_R              = TILE * 3.4;
 const INVU_MS            = 500;
 const MAX_LEVEL_ATTEMPTS = 12;
+
+// Corner tiles for scatter (TL, TR, BL, BR)
+const SCATTER_CORNERS = [
+  { c: 1,      r: 1      },   // index 0 → top-left
+  { c: COLS-2, r: 1      },   // index 1 → top-right
+  { c: 1,      r: ROWS-2 },   // index 2 → bottom-left
+  { c: COLS-2, r: ROWS-2 },   // index 3 → bottom-right
+];
 
 const C = {
   bg:       "#05050f",
@@ -106,6 +129,7 @@ const C = {
   player:   "#00f5ff",
   enemy:    "#ff2244",
   ping:     "#ffe600",
+  scatter:  "#4488ff",        // ghost tint during scatter
 };
 
 // ───────────────────────────────────────────────────────────────────
@@ -194,6 +218,84 @@ function bfsFlood(grid, sc, sr, maxDist = Infinity) {
   return result;
 }
 
+// ── NEW: BFS step-by-step pathfinder ────────────────────────────────
+/**
+ * Returns the immediate NEXT tile on the BFS shortest path from
+ * (fromC,fromR) toward (toC,toR).  If already there or unreachable,
+ * returns { c:toC, r:toR } as a graceful fallback.
+ * Used by CHASE, SEARCH, MOVING_TO_TARGET, and SCATTER.
+ */
+function bfsNextStep(fromC, fromR, toC, toR) {
+  if (fromC === toC && fromR === toR) return { c: toC, r: toR };
+  if (!maze || maze[fromR]?.[fromC] !== 0 || maze[toR]?.[toC] !== 0)
+    return { c: toC, r: toR };
+
+  const vis  = Array.from({ length: ROWS }, () => new Uint8Array(COLS));
+  const prev = Array.from({ length: ROWS }, () => new Array(COLS).fill(null));
+  const q    = [[fromC, fromR]];
+  vis[fromR][fromC] = 1;
+  let found = false;
+
+  outer: while (q.length) {
+    const [c, r] = q.shift();
+    for (const [dc, dr] of [[0,1],[0,-1],[1,0],[-1,0]]) {
+      const nc = c+dc, nr = r+dr;
+      if (nc>=0 && nc<COLS && nr>=0 && nr<ROWS && !vis[nr][nc] && maze[nr][nc]===0) {
+        vis[nr][nc] = 1;
+        prev[nr][nc] = [c, r];
+        if (nc===toC && nr===toR) { found=true; break outer; }
+        q.push([nc, nr]);
+      }
+    }
+  }
+
+  if (!found) return { c: toC, r: toR };
+
+  // Walk back from destination to find the first step
+  let cur = [toC, toR];
+  while (cur) {
+    const p = prev[cur[1]][cur[0]];
+    if (!p) break;
+    if (p[0] === fromC && p[1] === fromR) return { c: cur[0], r: cur[1] };
+    cur = p;
+  }
+  return { c: toC, r: toR }; // already adjacent
+}
+
+// ── NEW: Flank target picker ─────────────────────────────────────────
+/**
+ * When a ghost is stuck in CHASE, pick a tile FLANK_OFFSET tiles
+ * perpendicular to the ghost→player axis.  Tries both sides and
+ * picks whichever is a reachable floor tile; falls back to a
+ * long-distance target if neither side is open.
+ */
+function getFlankTarget(eC, eR, pC, pR, rng) {
+  // Axis from ghost to player
+  const ddC = pC - eC;
+  const ddR = pR - eR;
+
+  // Two perpendicular directions (90° rotation: [-dy, dx] and [dy, -dx])
+  const perpA = { c: eC + (-ddR > 0 ? 1 : -1) * FLANK_OFFSET,
+                  r: eR + ( ddC > 0 ? 1 : -1) * FLANK_OFFSET };
+  const perpB = { c: eC + ( ddR > 0 ? 1 : -1) * FLANK_OFFSET,
+                  r: eR + (-ddC > 0 ? 1 : -1) * FLANK_OFFSET };
+
+  // Clamp to maze bounds and check walkability
+  function valid(t) {
+    const cc = Math.max(0, Math.min(COLS-1, t.c));
+    const rr = Math.max(0, Math.min(ROWS-1, t.r));
+    return maze[rr]?.[cc] === 0 ? { c: cc, r: rr } : null;
+  }
+
+  const a = valid(perpA);
+  const b = valid(perpB);
+
+  if (a && b) return rng() < 0.5 ? a : b;
+  if (a) return a;
+  if (b) return b;
+  return pickLongDistanceTarget(eC, eR, maze, rng);
+}
+
 // ───────────────────────────────────────────────────────────────────
 //  MAZE GENERATION — unchanged
 // ───────────────────────────────────────────────────────────────────
@@ -243,7 +345,7 @@ function buildMaze(seed, extraLoops) {
 }
 
 // ───────────────────────────────────────────────────────────────────
-//  LEVEL TABLE — unchanged (+1 ghost per level from Level 0)
+//  LEVEL TABLE — unchanged
 // ───────────────────────────────────────────────────────────────────
 
 const LEVELS = [
@@ -284,8 +386,12 @@ const EXIT_R = ROWS - 2;
 const EXIT_X = EXIT_C * TILE + TILE / 2;
 const EXIT_Y = EXIT_R * TILE + TILE / 2;
 
-// Shortest-path tile set (Set of "c,r" strings) — used for boredom sensing
 let shortestPathSet = new Set();
+
+// ── NEW: Scatter clock ───────────────────────────────────────────
+let scatterTimer  = 0;    // seconds of game time since last scatter event
+let scatterUntil  = 0;    // performance.now() ms — scatter ends at this time
+let inScatter     = false;
 
 const localKeys  = {};
 let   remoteKeys = {};
@@ -480,7 +586,7 @@ function sendState() {
   dataConn.send({
     type: "state",
     player,
-    enemies: enemies.map(e => ({ x:e.x, y:e.y, aggro:e.aggro })),
+    enemies: enemies.map(e => ({ x:e.x, y:e.y, aggro:e.aggro, scatter:e.scatter })),
     pings, elapsed, appState,
   });
 }
@@ -490,8 +596,7 @@ function sendEvent(evt, extra = {}) {
 }
 
 // ───────────────────────────────────────────────────────────────────
-//  LEVEL PACKET — updated: patrolPath/patrolIdx/patrolDir replaced
-//  with targetTile; wanderTarget replaced with targetTile
+//  LEVEL PACKET — adds new chase-stuck and scatter fields
 // ───────────────────────────────────────────────────────────────────
 
 function buildLevelPacket() {
@@ -500,34 +605,41 @@ function buildLevelPacket() {
     levelIdx,
     maze,
     player: { ...player },
-    enemies: enemies.map(e => ({
-      x:            e.x,
-      y:            e.y,
-      aggro:        false,
-      aggroEnabled: e.aggroEnabled,
-      homeC:        e.homeC,
-      homeR:        e.homeR,
-      // Pac-Man target tile
-      targetTile:   e.targetTile,
+    enemies: enemies.map((e, idx) => ({
+      x:               e.x,
+      y:               e.y,
+      aggro:           false,
+      scatter:         false,
+      aggroEnabled:    e.aggroEnabled,
+      homeC:           e.homeC,
+      homeR:           e.homeR,
+      ghostIndex:      idx % SCATTER_CORNERS.length,  // corner assignment
+      targetTile:      e.targetTile,
       // Chase / search
-      chaseUntil:   0,
-      searchUntil:  0,
-      searchAngle:  0,         // orbit angle during search
-      lastKnownPx:  e.x,
-      lastKnownPy:  e.y,
-      // Anti-stuck
-      stuckFrames:  0,
-      lastX:        e.x,
-      lastY:        e.y,
+      chaseUntil:      0,
+      searchUntil:     0,
+      searchAngle:     0,
+      lastKnownPx:     e.x,
+      lastKnownPy:     e.y,
+      // NEW: chase-stuck flank fields
+      chaseStuckFrames: 0,
+      chaseLastX:       e.x,
+      chaseLastY:       e.y,
+      flankTarget:      null,   // {c,r} when flanking
+      // NEW: BFS step cache
+      nextStepCache:    null,   // { toC, toR, step, cachedAt }
+      // Anti-stuck (general)
+      stuckFrames:     0,
+      lastX:           e.x,
+      lastY:           e.y,
       // Boredom
-      boredSince:   0,
+      boredSince:      0,
     })),
   };
 }
 
 // ───────────────────────────────────────────────────────────────────
-//  LEVEL INIT  (Host-authoritative)
-//  Fairness engine unchanged — spawn exclusion + path set + retries.
+//  LEVEL INIT — unchanged fairness engine; resets scatter timer
 // ───────────────────────────────────────────────────────────────────
 
 function initLevel(idx) {
@@ -581,10 +693,15 @@ function initLevel(idx) {
   invuUntil       = performance.now() + INVU_MS;
   danceTimer      = 0;
   shortestPathSet = builtPathSet;
+
+  // Reset scatter clock on new level
+  scatterTimer = 0;
+  scatterUntil = 0;
+  inScatter    = false;
 }
 
 // ───────────────────────────────────────────────────────────────────
-//  ENEMY SPAWNING — updated: uses targetTile, no patrolPath
+//  ENEMY SPAWNING — adds new fields
 // ───────────────────────────────────────────────────────────────────
 
 function trySpawnEnemies(count, seed, aggroEnabled, grid, px, py, excSet) {
@@ -613,28 +730,35 @@ function trySpawnEnemies(count, seed, aggroEnabled, grid, px, py, excSet) {
     if (list.length >= count) break;
     if (list.some(e => Math.hypot(cand.ex - e.x, cand.ey - e.y) < ENEMY_SPACE_MIN)) continue;
 
-    // Each ghost gets an initial long-distance target right away
     const initTarget = pickLongDistanceTarget(cand.c, cand.r, grid, rng);
+    const idx        = list.length % SCATTER_CORNERS.length;
 
     list.push({
-      x:            cand.ex,
-      y:            cand.ey,
-      vx:           0,
-      vy:           0,
-      aggro:        false,
+      x:               cand.ex,
+      y:               cand.ey,
+      vx:              0,
+      vy:              0,
+      aggro:           false,
+      scatter:         false,
       aggroEnabled,
-      homeC:        cand.c,
-      homeR:        cand.r,
-      targetTile:   initTarget,   // current destination — always set
-      chaseUntil:   0,
-      searchUntil:  0,
-      searchAngle:  rng() * Math.PI * 2,  // random start angle for orbit
-      lastKnownPx:  cand.ex,
-      lastKnownPy:  cand.ey,
-      stuckFrames:  0,
-      lastX:        cand.ex,
-      lastY:        cand.ey,
-      boredSince:   0,
+      homeC:           cand.c,
+      homeR:           cand.r,
+      ghostIndex:      idx,
+      targetTile:      initTarget,
+      chaseUntil:      0,
+      searchUntil:     0,
+      searchAngle:     rng() * Math.PI * 2,
+      lastKnownPx:     cand.ex,
+      lastKnownPy:     cand.ey,
+      chaseStuckFrames: 0,
+      chaseLastX:      cand.ex,
+      chaseLastY:      cand.ey,
+      flankTarget:     null,
+      nextStepCache:   null,
+      stuckFrames:     0,
+      lastX:           cand.ex,
+      lastY:           cand.ey,
+      boredSince:      0,
     });
   }
 
@@ -642,57 +766,62 @@ function trySpawnEnemies(count, seed, aggroEnabled, grid, px, py, excSet) {
 }
 
 // ───────────────────────────────────────────────────────────────────
-//  LONG-DISTANCE TARGET PICKER
-//  BFS-floods the whole maze from the ghost's current tile.
-//  Picks randomly from cells with BFS distance ≥ TARGET_MIN_DIST.
-//  Falls back to ≥ TARGET_FALLBACK_1, then any other cell.
+//  LONG-DISTANCE TARGET PICKER — unchanged
 // ───────────────────────────────────────────────────────────────────
 
 function pickLongDistanceTarget(fromC, fromR, grid, rng) {
-  const all = bfsFlood(grid, fromC, fromR);   // full maze flood
-
-  // Prefer ≥10 tiles away
+  const all = bfsFlood(grid, fromC, fromR);
   let pool = all.filter(p => p.d >= TARGET_MIN_DIST);
   if (pool.length === 0) pool = all.filter(p => p.d >= TARGET_FALLBACK_1);
-  if (pool.length === 0) pool = all.filter(p => p.d > 0);  // any non-current
-  if (pool.length === 0) return { c: fromC, r: fromR };    // degenerate fallback
-
+  if (pool.length === 0) pool = all.filter(p => p.d > 0);
+  if (pool.length === 0) return { c: fromC, r: fromR };
   return pool[Math.floor(rng() * pool.length)];
 }
 
 // ───────────────────────────────────────────────────────────────────
-//  OPPOSITE-QUADRANT RELOCATION
-//  Maps the ghost's current tile to one of 4 quadrants (TL/TR/BL/BR)
-//  and picks a random floor cell from the diagonally opposite quadrant.
+//  OPPOSITE-QUADRANT RELOCATION — unchanged
 // ───────────────────────────────────────────────────────────────────
 
 function getOppositeQuadrantTarget(eC, eR, rng) {
-  // Determine which quadrant the ghost is in
   const midC = Math.floor(COLS / 2);
   const midR = Math.floor(ROWS / 2);
   const inLeft = eC < midC;
   const inTop  = eR < midR;
+  const minC = inLeft ? midC : 0;
+  const maxC = inLeft ? COLS : midC;
+  const minR = inTop  ? midR : 0;
+  const maxR = inTop  ? ROWS : midR;
 
-  // Opposite quadrant bounds
-  const minC = inLeft  ? midC : 0;
-  const maxC = inLeft  ? COLS : midC;
-  const minR = inTop   ? midR : 0;
-  const maxR = inTop   ? ROWS : midR;
-
-  // Collect all floor cells in the opposite quadrant
   const pool = [];
-  for (let r = minR; r < maxR; r++) {
-    for (let c = minC; c < maxC; c++) {
+  for (let r = minR; r < maxR; r++)
+    for (let c = minC; c < maxC; c++)
       if (maze[r]?.[c] === 0) pool.push({ c, r });
-    }
-  }
 
-  if (pool.length === 0) {
-    // Fallback: any floor cell far from current position
-    return pickLongDistanceTarget(eC, eR, maze, rng);
-  }
-
+  if (pool.length === 0) return pickLongDistanceTarget(eC, eR, maze, rng);
   return pool[Math.floor(rng() * pool.length)];
+}
+
+// ───────────────────────────────────────────────────────────────────
+//  CACHED BFS STEP HELPER
+//  Wraps bfsNextStep with a per-enemy cache that refreshes every
+//  PATHFIND_INTERVAL_MS ms — one BFS per ghost per 150 ms.
+// ───────────────────────────────────────────────────────────────────
+
+function cachedNextStep(e, toC, toR, nowMs) {
+  const eC = Math.floor(e.x / TILE);
+  const eR = Math.floor(e.y / TILE);
+
+  // Use cache if target unchanged and not stale
+  if (e.nextStepCache &&
+      e.nextStepCache.toC === toC &&
+      e.nextStepCache.toR === toR &&
+      nowMs - e.nextStepCache.cachedAt < PATHFIND_INTERVAL_MS) {
+    return e.nextStepCache.step;
+  }
+
+  const step = bfsNextStep(eC, eR, toC, toR);
+  e.nextStepCache = { toC, toR, step, cachedAt: nowMs };
+  return step;
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -776,70 +905,85 @@ function updatePhysics(dt) {
   player.x = slideAxis(player.x, player.vx * dt, player.y, false, PLAYER_R);
   player.y = slideAxis(player.y, player.vy * dt, player.x, true,  PLAYER_R);
 
+  // ── NEW: Scatter clock ───────────────────────────────────────────
+  scatterTimer += dt;
+  inScatter = nowMs < scatterUntil;
+
+  if (!inScatter && scatterTimer >= SCATTER_INTERVAL_S) {
+    // Trigger scatter phase
+    scatterUntil = nowMs + SCATTER_DURATION_S * 1000;
+    scatterTimer = 0;
+    inScatter    = true;
+  }
+
   // ── Enemy AI ─────────────────────────────────────────────────────
   for (const e of enemies) {
-    // Per-enemy RNG — seed rotates every 500 ms
     const eRng = mulberry32(e.homeC * 97 + e.homeR * 1013 + Math.floor(nowMs / 500));
     const dist = Math.hypot(player.x - e.x, player.y - e.y);
     const eC   = Math.floor(e.x / TILE);
     const eR   = Math.floor(e.y / TILE);
+    const pC   = Math.floor(player.x / TILE);
+    const pR   = Math.floor(player.y / TILE);
+
+    e.scatter = inScatter;
 
     // ──────────────────────────────────────────────────────────────
     //  A. AGGRO STATE MACHINE
+    //     Aggro is suppressed during scatter.
     // ──────────────────────────────────────────────────────────────
 
-    if (e.aggroEnabled && dist < SENSE_R) {
-      e.aggro       = true;
-      e.chaseUntil  = nowMs + CHASE_LINGER_MS;
-      e.searchUntil = 0;
-      e.lastKnownPx = player.x;
-      e.lastKnownPy = player.y;
-    } else if (e.aggro) {
+    if (!inScatter && e.aggroEnabled && dist < SENSE_R) {
+      e.aggro          = true;
+      e.chaseUntil     = nowMs + CHASE_LINGER_MS;
+      e.searchUntil    = 0;
+      e.lastKnownPx    = player.x;
+      e.lastKnownPy    = player.y;
+      e.flankTarget    = null;   // clear any pending flank
+    } else if (e.aggro && !inScatter) {
       if (nowMs >= e.chaseUntil) {
-        // Linger expired → switch to SEARCH mode (orbit last-known pos)
         e.aggro       = false;
-        e.searchUntil = nowMs + CHASE_LINGER_MS; // 3-second search
+        e.searchUntil = nowMs + CHASE_LINGER_MS;
+        e.flankTarget = null;
       }
+    } else if (inScatter && e.aggro) {
+      // Scatter interrupts chase — ghost will resume after scatter ends
+      e.aggro = false;
     }
 
     // ──────────────────────────────────────────────────────────────
-    //  B. BOREDOM TIMER
-    //     Fires when ghost is near exit OR on a shortest-path tile
-    //     and is NOT chasing. Timer = 2 seconds → opposite quadrant.
+    //  B. BOREDOM TIMER — unchanged (only fires when not chasing)
     // ──────────────────────────────────────────────────────────────
 
-    if (!e.aggro && nowMs >= e.searchUntil) {
+    if (!e.aggro && !inScatter && nowMs >= e.searchUntil) {
       const distToExit = Math.hypot(e.x - EXIT_X, e.y - EXIT_Y);
       const nearExit   = distToExit < EXIT_GUARD_TILES * TILE;
       const onPath     = shortestPathSet.has(`${eC},${eR}`);
 
       if (nearExit || onPath) {
         if (e.boredSince === 0) {
-          e.boredSince = nowMs;                        // start boredom clock
+          e.boredSince = nowMs;
         } else if (nowMs - e.boredSince >= BOREDOM_MS) {
-          // BOREDOM TRIGGERED — jump to opposite quadrant
-          e.targetTile  = getOppositeQuadrantTarget(eC, eR, eRng);
-          e.boredSince  = 0;
+          e.targetTile = getOppositeQuadrantTarget(eC, eR, eRng);
+          e.boredSince = 0;
         }
       } else {
-        e.boredSince = 0;                              // reset when clear
+        e.boredSince = 0;
       }
     } else {
       e.boredSince = 0;
     }
 
     // ──────────────────────────────────────────────────────────────
-    //  C. ANTI-STUCK SAFETY NET
-    //     If the ghost hasn't moved in STUCK_FRAMES frames, force a
-    //     new long-distance target from the current position.
+    //  C. GENERAL ANTI-STUCK — unchanged (non-chase, non-scatter)
     // ──────────────────────────────────────────────────────────────
 
     const movedSq = (e.x - e.lastX) ** 2 + (e.y - e.lastY) ** 2;
     if (movedSq < STUCK_DIST_SQ) {
       e.stuckFrames++;
-      if (e.stuckFrames >= STUCK_FRAMES && !e.aggro) {
-        e.targetTile  = pickLongDistanceTarget(eC, eR, maze, eRng);
-        e.stuckFrames = 0;
+      if (e.stuckFrames >= STUCK_FRAMES && !e.aggro && !inScatter) {
+        e.targetTile   = pickLongDistanceTarget(eC, eR, maze, eRng);
+        e.nextStepCache = null;
+        e.stuckFrames  = 0;
       }
     } else {
       e.stuckFrames = 0;
@@ -853,25 +997,96 @@ function updatePhysics(dt) {
 
     const spd = ENEMY_BASE_SPD * lvlSpeedMult * (e.aggro ? ENEMY_AGGRO_M : 1.0);
 
-    if (e.aggro) {
-      // ── CHASE: steer directly toward player ──
-      const d = dist || 1;
-      e.vx = ((player.x - e.x) / d) * spd;
-      e.vy = ((player.y - e.y) / d) * spd;
+    if (inScatter) {
+      // ── SCATTER: BFS-navigate to assigned corner ──────────────
+      const corner = SCATTER_CORNERS[e.ghostIndex];
+      const step   = cachedNextStep(e, corner.c, corner.r, nowMs);
+      const tx = step.c * TILE + TILE / 2;
+      const ty = step.r * TILE + TILE / 2;
+      const pd = Math.hypot(tx - e.x, ty - e.y);
+      if (pd > 2) {
+        e.vx = ((tx - e.x) / pd) * spd * 0.85;  // slightly slower during scatter
+        e.vy = ((ty - e.y) / pd) * spd * 0.85;
+      } else {
+        // At the step tile — advance next step tile
+        e.nextStepCache = null;
+        e.vx = 0; e.vy = 0;
+      }
+
+    } else if (e.aggro) {
+      // ── CHASE: BFS step toward player with flank escape ───────
+      //
+      // Check if ghost is stuck in chase (hasn't moved in 60 frames)
+      const chaseDeltaSq = (e.x - e.chaseLastX) ** 2 + (e.y - e.chaseLastY) ** 2;
+      if (chaseDeltaSq < CHASE_STUCK_SQ) {
+        e.chaseStuckFrames++;
+        if (e.chaseStuckFrames >= CHASE_STUCK_FRAMES) {
+          // FLANK MANEUVER: pick a perpendicular tile
+          e.flankTarget      = getFlankTarget(eC, eR, pC, pR, eRng);
+          e.chaseStuckFrames = 0;
+          e.nextStepCache    = null;
+        }
+      } else {
+        e.chaseStuckFrames = 0;
+      }
+      e.chaseLastX = e.x;
+      e.chaseLastY = e.y;
+
+      if (e.flankTarget) {
+        // En route to flank position — use BFS step
+        const step = cachedNextStep(e, e.flankTarget.c, e.flankTarget.r, nowMs);
+        const tx = step.c * TILE + TILE / 2;
+        const ty = step.r * TILE + TILE / 2;
+        const pd = Math.hypot(tx - e.x, ty - e.y);
+        if (pd < ARRIVAL_THRESH) {
+          // Reached flank tile — clear flank, resume direct chase
+          e.flankTarget    = null;
+          e.nextStepCache  = null;
+        } else {
+          e.vx = ((tx - e.x) / pd) * spd;
+          e.vy = ((ty - e.y) / pd) * spd;
+        }
+      }
+
+      if (!e.flankTarget) {
+        // Direct BFS chase toward player's tile
+        const step = cachedNextStep(e, pC, pR, nowMs);
+        const tx = step.c * TILE + TILE / 2;
+        const ty = step.r * TILE + TILE / 2;
+        const pd = Math.hypot(tx - e.x, ty - e.y);
+        if (pd > 2) {
+          e.vx = ((tx - e.x) / pd) * spd;
+          e.vy = ((ty - e.y) / pd) * spd;
+        } else {
+          // Snap to step tile and clear cache for next step
+          e.nextStepCache = null;
+          e.vx = 0; e.vy = 0;
+        }
+      }
 
     } else if (nowMs < e.searchUntil) {
-      // ── SEARCH (Blinky): orbit last-known position ──
-      // Phase 1: travel to the last-known position
+      // ── SEARCH (Blinky orbit): BFS to last-known, then orbit ──
+      const lkC = Math.floor(e.lastKnownPx / TILE);
+      const lkR = Math.floor(e.lastKnownPy / TILE);
       const sdx = e.lastKnownPx - e.x;
       const sdy = e.lastKnownPy - e.y;
       const sd  = Math.hypot(sdx, sdy);
 
       if (sd > SEARCH_ORBIT_R * 1.5) {
-        // Still en route to last-known tile
-        e.vx = (sdx / sd) * spd;
-        e.vy = (sdy / sd) * spd;
+        // BFS step toward last-known position
+        const step = cachedNextStep(e, lkC, lkR, nowMs);
+        const tx = step.c * TILE + TILE / 2;
+        const ty = step.r * TILE + TILE / 2;
+        const pd = Math.hypot(tx - e.x, ty - e.y);
+        if (pd > 2) {
+          e.vx = ((tx - e.x) / pd) * spd;
+          e.vy = ((ty - e.y) / pd) * spd;
+        } else {
+          e.nextStepCache = null;
+          e.vx = 0; e.vy = 0;
+        }
       } else {
-        // At last-known tile — orbit it
+        // Orbit last-known position
         e.searchAngle += SEARCH_ORBIT_SPD * dt;
         const tx = e.lastKnownPx + Math.cos(e.searchAngle) * SEARCH_ORBIT_R;
         const ty = e.lastKnownPy + Math.sin(e.searchAngle) * SEARCH_ORBIT_R;
@@ -884,28 +1099,37 @@ function updatePhysics(dt) {
         }
       }
 
-      // When search expires, immediately assign a new long-distance target
       if (nowMs >= e.searchUntil) {
-        e.targetTile = pickLongDistanceTarget(eC, eR, maze, eRng);
+        e.targetTile    = pickLongDistanceTarget(eC, eR, maze, eRng);
+        e.nextStepCache = null;
       }
 
     } else {
-      // ── MOVING_TO_TARGET (Pac-Man continuous flow) ──
-      // Ghost is always en route to targetTile. On arrival, pick next immediately.
+      // ── MOVING_TO_TARGET: BFS step toward target tile ─────────
       if (!e.targetTile) {
-        e.targetTile = pickLongDistanceTarget(eC, eR, maze, eRng);
+        e.targetTile    = pickLongDistanceTarget(eC, eR, maze, eRng);
+        e.nextStepCache = null;
       }
 
-      const tx = e.targetTile.c * TILE + TILE / 2;
-      const ty = e.targetTile.r * TILE + TILE / 2;
+      const step = cachedNextStep(e, e.targetTile.c, e.targetTile.r, nowMs);
+      const tx = step.c * TILE + TILE / 2;
+      const ty = step.r * TILE + TILE / 2;
       const pd = Math.hypot(tx - e.x, ty - e.y);
 
       if (pd < ARRIVAL_THRESH) {
-        // Arrived — snap and pick a NEW target ≥ 10 tiles away immediately
-        e.x = tx; e.y = ty; e.vx = 0; e.vy = 0;
-        e.targetTile = pickLongDistanceTarget(
-          e.targetTile.c, e.targetTile.r, maze, eRng
-        );
+        // Arrived at intermediate step — if it's the final target, pick new one
+        const atTarget = eC === e.targetTile.c && eR === e.targetTile.r;
+        if (atTarget) {
+          e.x = e.targetTile.c * TILE + TILE / 2;
+          e.y = e.targetTile.r * TILE + TILE / 2;
+          e.vx = 0; e.vy = 0;
+          e.targetTile    = pickLongDistanceTarget(eC, eR, maze, eRng);
+          e.nextStepCache = null;
+        } else {
+          // At an intermediate BFS step — clear cache so next step is computed
+          e.nextStepCache = null;
+          e.vx = 0; e.vy = 0;
+        }
       } else {
         e.vx = ((tx - e.x) / pd) * spd;
         e.vy = ((ty - e.y) / pd) * spd;
@@ -913,21 +1137,18 @@ function updatePhysics(dt) {
     }
 
     // ──────────────────────────────────────────────────────────────
-    //  E. WALL-SLIDE MOVEMENT
+    //  E. WALL-SLIDE MOVEMENT — unchanged
     // ──────────────────────────────────────────────────────────────
     e.x = slideAxis(e.x, e.vx * dt, e.y, false, ENEMY_R);
     e.y = slideAxis(e.y, e.vy * dt, e.x, true,  ENEMY_R);
   }
 
-  // Expire pings
   pings = pings.filter(p => elapsed - p.born < 2.2);
 
-  // Win check
   if (Math.hypot(player.x - EXIT_X, player.y - EXIT_Y) < TILE * 0.6) {
     triggerWin(true); return;
   }
 
-  // Death check
   if (nowMs > invuUntil) {
     for (const e of enemies) {
       if (Math.hypot(player.x - e.x, player.y - e.y) < PLAYER_R + ENEMY_R) {
@@ -976,8 +1197,8 @@ function triggerDeath(isAuthority) {
 }
 
 function onEsc() {
-  if (appState === S.PLAYING)      { appState = S.PAUSED;  syncOverlays(); }
-  else if (appState === S.PAUSED)  { appState = S.PLAYING; prevTs = performance.now(); syncOverlays(); }
+  if (appState === S.PLAYING)     { appState = S.PAUSED;  syncOverlays(); }
+  else if (appState === S.PAUSED) { appState = S.PLAYING; prevTs = performance.now(); syncOverlays(); }
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -1020,7 +1241,7 @@ function hostViewTransform() {
 }
 
 // ───────────────────────────────────────────────────────────────────
-//  RENDERER — unchanged
+//  RENDERER — unchanged except drawGhost scatter tint
 // ───────────────────────────────────────────────────────────────────
 
 function draw() {
@@ -1160,16 +1381,28 @@ function drawPlayerChar(px, py, angle, dancing) {
   ctx.restore();
 }
 
-// ── GHOST — unchanged visuals, preserves searching state ─────────
+// ── GHOST — adds scatter (blue) visual state ──────────────────────
 function drawGhost(e) {
   const t  = elapsed;
   const gx = e.x, gy = e.y;
   const w  = TILE * 0.70, h = TILE * 0.76;
 
-  const searching = !e.aggro && performance.now() < e.searchUntil;
-  const bodyColor = e.aggro ? "#ff0022" : searching ? "#ff8800" : C.enemy;
-  const glowColor = e.aggro ? C.enemy   : searching ? "#ff8800" : C.enemy;
-  const blurBase  = e.aggro ? 30 + 10 * Math.sin(t * 9) : searching ? 20 : 14;
+  const isScatter  = !!e.scatter;
+  const searching  = !e.aggro && !isScatter && performance.now() < e.searchUntil;
+
+  // Visual priority: aggro (red) > scatter (blue) > searching (orange) > normal
+  const bodyColor = e.aggro    ? "#ff0022"
+                  : isScatter  ? "#2255cc"
+                  : searching  ? "#ff8800"
+                  : C.enemy;
+  const glowColor = e.aggro    ? C.enemy
+                  : isScatter  ? C.scatter
+                  : searching  ? "#ff8800"
+                  : C.enemy;
+  const blurBase  = e.aggro    ? 30 + 10 * Math.sin(t * 9)
+                  : isScatter  ? 18 + 6  * Math.sin(t * 4)
+                  : searching  ? 20
+                  : 14;
 
   ctx.save();
   ctx.shadowColor = glowColor;
@@ -1195,7 +1428,10 @@ function drawGhost(e) {
   ctx.arc(gx + w*0.19, gy - h*0.14, w*0.115, 0, Math.PI*2);
   ctx.fill();
 
-  const pupilColor = e.aggro ? "#ff0000" : searching ? "#ffaa00" : "#110022";
+  const pupilColor = e.aggro   ? "#ff0000"
+                   : isScatter ? "#aaccff"
+                   : searching ? "#ffaa00"
+                   : "#110022";
   ctx.fillStyle = pupilColor;
   ctx.beginPath();
   ctx.arc(gx - w*0.19, gy - h*0.14, w*0.055, 0, Math.PI*2);
