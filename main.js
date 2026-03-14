@@ -1,58 +1,66 @@
 /**
  * ═══════════════════════════════════════════════════════════════════
- *  OVER HERE! — main.js  (full rewrite, bug-fixed)
- *  Vite + PeerJS P2P Networked Maze Game
+ *  OVER HERE! — main.js  v4  (black-screen fix + pause/leave)
+ *  Vite + PeerJS
  * ═══════════════════════════════════════════════════════════════════
  *
- *  HOST  = "Viewer"  — sees full map + all enemies. Clicks to Ping.
- *          Drives physics, AI, timer (source of truth). Sends state
- *          to Mover every frame via DataConnection.
+ *  KEY ARCHITECTURAL DECISIONS
+ *  ────────────────────────────
+ *  • HOST is the sole source of truth for all physics / AI / timer.
+ *  • On Mover connect, Host sends a { type:'START_GAME' } packet
+ *    containing the full maze and spawn point → Mover transitions to
+ *    PLAYING immediately (no blank screen).
+ *  • Host sends { type:'STATE' } every ~16 ms (≈60 fps) thereafter.
+ *  • Mover sends { type:'INPUT' } every frame.
+ *  • ESC pauses both clients; pause overlay shows Leave button.
+ *  • "Leave Game" closes PeerJS conn and calls location.reload().
  *
- *  MOVER = "Player" — sees Fog-of-War. WASD/Arrow movement.
- *          Sends input to Host every frame. Receives rendered state.
+ *  PACKET TYPES (Host → Mover)
+ *  ────────────────────────────
+ *   START_GAME  { maze, spawn, levelIdx }
+ *   STATE       { player, enemies, pings, elapsed, appState }
+ *   LOAD_LEVEL  { maze, spawn, levelIdx }
+ *   EVENT       { evt: 'win'|'death'|'ping' }
  *
- *  VOICE — PeerJS MediaConnection auto-established on connect.
- *
- *  KEY FIXES IN THIS VERSION
- *  ─────────────────────────
- *  ✔ Simultaneous PLAYING transition: Host sends levelData immediately
- *    on DataConnection open; Mover transitions the moment it arrives.
- *  ✔ Spawn Safety: enemies placed ≥5 tiles from player start.
- *  ✔ 500ms invulnerability window at level start.
- *  ✔ BGM plays on first UI interaction; stops the instant game starts.
- *  ✔ Win/Death SFX wired correctly.
- *  ✔ Victory Dance animation state.
- *  ✔ 10 multi-path levels with proper difficulty curve.
- *  ✔ All HUD/UI text forced white with thick shadow.
+ *  PACKET TYPES (Mover → Host)
+ *  ────────────────────────────
+ *   INPUT       { keys }
  * ═══════════════════════════════════════════════════════════════════
  */
 
 import Peer from "peerjs";
 
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 //  CONSTANTS
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 
-const TILE = 40;          // px per maze cell
-const COLS = 19;          // must be odd
-const ROWS = 15;          // must be odd
-const W    = COLS * TILE; // 760
-const H    = ROWS * TILE; // 600
+const TILE   = 40;
+const COLS   = 19;   // odd
+const ROWS   = 15;   // odd
+const MW     = COLS * TILE;   // 760
+const MH     = ROWS * TILE;   // 600
 
-const PLAYER_R       = TILE * 0.36;  // collision radius
-const PLAYER_SPEED   = 185;          // px/s
+const PLAYER_SPEED   = 185;   // px / s
+const PLAYER_R       = TILE * 0.36;
 const ENEMY_R        = TILE * 0.38;
-const ENEMY_BASE_SPD = 75;
-const ENEMY_AGGRO_M  = 2.2;
-const SENSE_R        = TILE * 3.8;
-const FOG_R          = TILE * 3.4;
-const INVU_MS        = 500;          // invulnerability at level start
-const SPAWN_MIN_DIST = TILE * 5;     // min enemy distance from player
+const ENEMY_BASE_SPD = 76;
+const ENEMY_AGGRO_M  = 2.25;
+const SENSE_R        = TILE * 3.9;
+const FOG_R          = TILE * 3.5;
+const INVU_MS        = 550;          // invulnerability at level start
+const SPAWN_MIN_D    = TILE * 5;     // min distance from player spawn
 
-const C = {
-  bg:       "#05050f",
-  wall:     "#0c1030",
-  wallGlow: "#1a3080",
+// World-space exit position
+const EXIT_C = COLS - 2;
+const EXIT_R = ROWS - 2;
+const EXIT_X = EXIT_C * TILE + TILE / 2;
+const EXIT_Y = EXIT_R * TILE + TILE / 2;
+
+// Colours (used in canvas renderer)
+const CLR = {
+  bg:       "#04040e",
+  wall:     "#1a0a3a",
+  wallGlow: "#7b2fff",
   floor:    "#060611",
   exit:     "#39ff14",
   player:   "#00f5ff",
@@ -60,27 +68,26 @@ const C = {
   ping:     "#ffe600",
 };
 
-// ───────────────────────────────────────────────────────────────────
-//  RNG
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
+//  SEEDED RNG  (mulberry32)
+// ─────────────────────────────────────────────────────────────────
 
-function mulberry32(seed) {
+function rngFactory(seed) {
+  let s = seed | 0;
   return () => {
-    seed |= 0;
-    seed = (seed + 0x6D2B79F5) | 0;
-    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    s = (s + 0x6D2B79F5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
     t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
 
-// ───────────────────────────────────────────────────────────────────
-//  MAZE GENERATION
-//  Recursive backtracker + loop cuts → imperfect maze (multi-path)
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
+//  MAZE GENERATOR  (recursive backtracker + loop cuts)
+// ─────────────────────────────────────────────────────────────────
 
 function buildMaze(seed, extraLoops) {
-  const rng  = mulberry32(seed);
+  const rng  = rngFactory(seed);
   const grid = Array.from({ length: ROWS }, () => Array(COLS).fill(1));
   const vis  = Array.from({ length: ROWS }, () => Array(COLS).fill(false));
 
@@ -90,7 +97,7 @@ function buildMaze(seed, extraLoops) {
     const dirs = [[0,-2],[0,2],[-2,0],[2,0]].sort(() => rng() - 0.5);
     for (const [dx, dy] of dirs) {
       const nx = cx + dx, ny = cy + dy;
-      if (nx > 0 && nx < COLS-1 && ny > 0 && ny < ROWS-1 && !vis[ny][nx]) {
+      if (nx > 0 && nx < COLS - 1 && ny > 0 && ny < ROWS - 1 && !vis[ny][nx]) {
         grid[cy + dy / 2][cx + dx / 2] = 0;
         carve(nx, ny);
       }
@@ -98,73 +105,81 @@ function buildMaze(seed, extraLoops) {
   }
   carve(1, 1);
 
-  // Remove random interior walls to create loops / alternative paths
+  // Extra loop cuts → multi-path maze
   for (let i = 0; i < extraLoops; i++) {
     const x = Math.floor(rng() * (COLS - 2)) + 1;
     const y = Math.floor(rng() * (ROWS - 2)) + 1;
     if (grid[y][x] === 1) {
-      let floorNeighbors = 0;
-      for (const [dx, dy] of [[0,1],[0,-1],[1,0],[-1,0]]) {
-        if (grid[y+dy]?.[x+dx] === 0) floorNeighbors++;
+      let fn = 0;
+      for (const [dx,dy] of [[0,1],[0,-1],[1,0],[-1,0]]) {
+        if (grid[y+dy]?.[x+dx] === 0) fn++;
       }
-      if (floorNeighbors >= 2) grid[y][x] = 0;
+      if (fn >= 2) grid[y][x] = 0;
     }
   }
 
-  // Guarantee start and exit are open
+  // Force start and exit cells open
   grid[1][1]           = 0;
   grid[ROWS-2][COLS-2] = 0;
 
   return grid;
 }
 
-// ───────────────────────────────────────────────────────────────────
-//  LEVEL CONFIGS  — 10 levels
-//  loops: extra wall removals to create multi-path mazes
-//  enemies: count, speed multiplier per level baked into physics
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
+//  LEVEL TABLE  (10 levels)
+// ─────────────────────────────────────────────────────────────────
 
 const LEVELS = [
-  /* 1 */ { seed:1001, loops:10, enemies:0, aggroOn:false },
-  /* 2 */ { seed:1002, loops:10, enemies:1, aggroOn:false },
-  /* 3 */ { seed:1003, loops: 8, enemies:3, aggroOn:true  },
-  /* 4 */ { seed:1004, loops: 7, enemies:4, aggroOn:true  },
-  /* 5 */ { seed:1005, loops: 7, enemies:4, aggroOn:true  },
-  /* 6 */ { seed:1006, loops: 5, enemies:6, aggroOn:true  },
-  /* 7 */ { seed:1007, loops: 5, enemies:7, aggroOn:true  },
-  /* 8 */ { seed:1008, loops: 4, enemies:8, aggroOn:true  },
-  /* 9 */ { seed:1009, loops: 3, enemies:10,aggroOn:true  },
-  /*10 */ { seed:1010, loops: 2, enemies:13,aggroOn:true  },
+  /* 1  Tutorial  */ { seed: 2001, loops: 12, enemies: 0,  aggro: false },
+  /* 2  One ghost */ { seed: 2002, loops: 11, enemies: 1,  aggro: false },
+  /* 3  Aggro on  */ { seed: 2003, loops:  9, enemies: 3,  aggro: true  },
+  /* 4            */ { seed: 2004, loops:  8, enemies: 4,  aggro: true  },
+  /* 5            */ { seed: 2005, loops:  7, enemies: 5,  aggro: true  },
+  /* 6            */ { seed: 2006, loops:  6, enemies: 6,  aggro: true  },
+  /* 7            */ { seed: 2007, loops:  5, enemies: 7,  aggro: true  },
+  /* 8            */ { seed: 2008, loops:  4, enemies: 9,  aggro: true  },
+  /* 9            */ { seed: 2009, loops:  3, enemies: 11, aggro: true  },
+  /* 10 Final     */ { seed: 2010, loops:  2, enemies: 13, aggro: true  },
 ];
 
-// ───────────────────────────────────────────────────────────────────
-//  GAME STATE ENUM
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
+//  GAME-STATE ENUM
+// ─────────────────────────────────────────────────────────────────
 
-const S = { MENU:"MENU", PLAYING:"PLAYING", PAUSED:"PAUSED",
-            DANCING:"DANCING", WIN:"WIN", DEAD:"DEAD" };
+const GS = {
+  MENU:    "MENU",
+  PLAYING: "PLAYING",
+  PAUSED:  "PAUSED",
+  DANCING: "DANCING",   // victory animation
+  WIN:     "WIN",
+  DEAD:    "DEAD",
+};
 
-// ───────────────────────────────────────────────────────────────────
-//  RUNTIME VARS
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
+//  RUNTIME STATE
+// ─────────────────────────────────────────────────────────────────
 
-let appState    = S.MENU;
-let role        = null;       // "host" | "mover"
+let gs          = GS.MENU;
+let role        = null;    // "host" | "mover"
 let levelIdx    = 0;
 
-// World (authoritative on Host, mirrored via network on Mover)
+// Simulation world  (authoritative on Host; mirrored on Mover via network)
 let maze        = null;
-let player      = null;  // { x,y,vx,vy, angle }
-let enemies     = [];    // [{ x,y,vx,vy,aggro,patrolPath,patrolIdx }]
-let pings       = [];    // [{ x,y,born }]
-let elapsed     = 0;     // seconds
-let invuUntil   = 0;     // performance.now() — invulnerability end
-let danceTimer  = 0;     // seconds into victory dance
-let pingCounter = 0;
+let player      = null;   // { x, y, vx, vy, angle }
+let enemies     = [];     // [{ x,y,vx,vy,aggro,aggroEnabled,patrolPath,patrolIdx }]
+let pings       = [];     // [{ x, y, born }]
+let elapsed     = 0;      // seconds
+let invuUntil   = 0;      // performance.now() timestamp — death blocked until then
+let danceTimer  = 0;
+let pingCtr     = 0;
 
-// Input maps
-const localKeys  = {};   // this client's keyboard
-let   remoteKeys = {};   // Mover's keys received by Host
+// Input
+const localKeys  = {};
+let   remoteKeys = {};    // Mover's keys received on Host side
+
+// ─────────────────────────────────────────────────────────────────
+//  KEYBOARD
+// ─────────────────────────────────────────────────────────────────
 
 window.addEventListener("keydown", e => {
   localKeys[e.code] = true;
@@ -172,44 +187,44 @@ window.addEventListener("keydown", e => {
 });
 window.addEventListener("keyup", e => { localKeys[e.code] = false; });
 
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 //  AUDIO
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 
-const bgMusic  = new Audio("/bgmusic.mp3");
-bgMusic.loop   = true;
-bgMusic.volume = 0.2;
-let bgStarted  = false;
+const bgm    = new Audio("/bgmusic.mp3");
+bgm.loop     = true;
+bgm.volume   = 0.2;
+let bgmOn    = false;
 
 const sfxWin   = new Audio("/win.mp3");
 const sfxDeath = new Audio("/death.mp3");
-const sfxPing  = new Audio("/ping.mp3"); // optional, silent if missing
+const sfxPing  = new Audio("/ping.mp3");
 
-function playBgm() {
-  if (bgStarted) return;
-  bgStarted = true;
-  bgMusic.play().catch(() => {});
+function startBgm() {
+  if (bgmOn) return;
+  bgmOn = true;
+  bgm.play().catch(() => {});
 }
 
 function stopBgm() {
-  bgMusic.pause();
-  bgMusic.currentTime = 0;
-  bgStarted = false;
+  bgm.pause();
+  bgm.currentTime = 0;
+  bgmOn = false;
 }
 
-function playSfx(audio) {
+function playSfx(a) {
   try {
-    const c = audio.cloneNode();
-    c.volume = 0.7;
+    const c = a.cloneNode();
+    c.volume = 0.72;
     c.play().catch(() => {});
-  } catch(_) {}
+  } catch (_) {}
 }
 
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 //  CANVAS
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 
-const canvas = document.getElementById("game-canvas");
+const canvas = g("gc");
 const ctx    = canvas.getContext("2d");
 
 function resizeCanvas() {
@@ -219,98 +234,105 @@ function resizeCanvas() {
 window.addEventListener("resize", resizeCanvas);
 resizeCanvas();
 
-// ───────────────────────────────────────────────────────────────────
-//  PEERJS NETWORKING
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
+//  PEERJS
+// ─────────────────────────────────────────────────────────────────
 
-let peer       = null;
-let dataConn   = null;
-let mediaConn  = null;
+let peer        = null;
+let dataConn    = null;
+let mediaConn   = null;
 let localStream = null;
 
-function makeRoomId() {
+function makeId() {
   return Math.random().toString(36).slice(2, 10).toUpperCase();
 }
 
 async function getMic() {
   try {
-    localStream = await navigator.mediaDevices.getUserMedia({ audio:true, video:false });
+    localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
     return localStream;
-  } catch(e) {
-    console.warn("Mic not available:", e);
+  } catch (e) {
+    console.warn("Mic unavailable:", e);
     return null;
   }
 }
 
-// ── HOST INIT ─────────────────────────────────────────────────────
+// ── HOST ──────────────────────────────────────────────────────────
+
 function initHost() {
   role = "host";
-  const roomId = makeRoomId();
-  el("room-code-display").textContent = roomId;
+  const rid = makeId();
+  g("room-id-display").textContent = rid;
   setStatus("host", "⏳ Waiting for player…");
 
-  peer = new Peer(roomId, { debug: 0 });
+  peer = new Peer(rid, { debug: 0 });
 
-  peer.on("open", () => setStatus("host", "✅ Share the Room ID above!"));
+  peer.on("open", () => setStatus("host", "✅ Ready — share the Room ID above!"));
 
   peer.on("connection", dc => {
     dataConn = dc;
-    setStatus("host", "🎮 Player connecting…");
+    setStatus("host", "🔗 Player connecting…");
 
     dc.on("open", () => {
-      setStatus("host", "🎮 Player connected! Starting…");
-      // ── CRITICAL HANDSHAKE FIX ──────────────────────────────────
-      // Build the level immediately and send full levelData so Mover
-      // can transition to PLAYING without delay.
-      initLevel(levelIdx);              // sets maze, player, enemies
-      const packet = buildLevelPacket(); // package everything
-      dc.send(packet);                  // Mover gets it → PLAYING
+      setStatus("host", "🎮 Connected! Sending level…");
 
-      // Host transitions to PLAYING too
-      transitionToGame();
+      // ── CRITICAL FIX: build level THEN send START_GAME immediately ──
+      prepareLevel(levelIdx);
+
+      dc.send({
+        type:     "START_GAME",
+        levelIdx: levelIdx,
+        maze:     maze,
+        spawn:    { x: player.x, y: player.y },
+        enemies:  enemies.map(serEnemy),
+      });
+
+      // Now transition host to PLAYING
+      goPlaying();
     });
 
-    dc.on("data", onDataFromMover);
-    dc.on("error", e => console.error("DC error:", e));
+    dc.on("data",  onFromMover);
+    dc.on("error", e => console.error("DC:", e));
+    dc.on("close", () => console.warn("DC closed"));
   });
 
   peer.on("call", async call => {
     const s = await getMic();
     call.answer(s || undefined);
-    call.on("stream", attachRemoteAudio);
+    call.on("stream", hookAudio);
   });
 
   peer.on("error", e => {
-    setStatus("host", `❌ PeerJS: ${e.type}`);
+    setStatus("host", `❌ ${e.type}`);
     console.error(e);
   });
 }
 
-// ── MOVER INIT ────────────────────────────────────────────────────
+// ── MOVER ─────────────────────────────────────────────────────────
+
 async function initMover(hostId) {
   role = "mover";
-  setStatus("join", "⏳ Connecting to host…");
+  setStatus("join", "⏳ Connecting…");
 
   peer = new Peer(undefined, { debug: 0 });
 
   peer.on("open", async () => {
     const stream = await getMic();
 
-    // Data channel
     dataConn = peer.connect(hostId, { reliable: true, serialization: "json" });
 
     dataConn.on("open", () => {
-      setStatus("join", "✅ Connected! Waiting for level…");
-
-      // Voice call to host
+      setStatus("join", "✅ Connected! Waiting for level data…");
+      // Voice
       if (stream) {
         mediaConn = peer.call(hostId, stream);
-        mediaConn.on("stream", attachRemoteAudio);
+        mediaConn.on("stream", hookAudio);
       }
     });
 
-    dataConn.on("data", onDataFromHost);
-    dataConn.on("error", e => console.error("DC error:", e));
+    dataConn.on("data",  onFromHost);
+    dataConn.on("error", e => console.error("DC:", e));
+    dataConn.on("close", () => console.warn("DC closed"));
   });
 
   peer.on("error", e => {
@@ -319,163 +341,165 @@ async function initMover(hostId) {
   });
 }
 
-function attachRemoteAudio(stream) {
-  const audio = new Audio();
-  audio.srcObject = stream;
-  audio.autoplay  = true;
-  audio.play().catch(() => {});
-  el("voice-badge").classList.remove("hidden");
+function hookAudio(stream) {
+  const a = new Audio();
+  a.srcObject = stream;
+  a.autoplay  = true;
+  a.play().catch(() => {});
+  g("voice-badge").classList.remove("hidden");
 }
 
 // ── DATA HANDLERS ─────────────────────────────────────────────────
 
-function onDataFromMover(pkt) {
+function onFromMover(pkt) {
   if (!pkt) return;
-  if (pkt.type === "input") remoteKeys = pkt.keys || {};
+  if (pkt.type === "INPUT") remoteKeys = pkt.keys || {};
 }
 
-function onDataFromHost(pkt) {
+function onFromHost(pkt) {
   if (!pkt) return;
 
   switch (pkt.type) {
 
-    case "levelData":
-      // Receive maze + initial positions — transition to PLAYING
-      maze    = pkt.maze;
-      player  = pkt.player;
-      enemies = pkt.enemies;
-      pings   = [];
-      elapsed = 0;
-      levelIdx = pkt.levelIdx;
+    // ── THE FIX: Mover receives START_GAME, transitions immediately ──
+    case "START_GAME":
+      maze     = pkt.maze;
+      levelIdx = pkt.levelIdx ?? 0;
+      // Restore full enemy objects from serialised form
+      enemies  = (pkt.enemies || []).map(deserEnemy);
+      pings    = [];
+      elapsed  = 0;
+      // ── Camera fix: set player at the spawn point the Host sent ──
+      player   = { x: pkt.spawn.x, y: pkt.spawn.y, vx: 0, vy: 0, angle: 0 };
       invuUntil = performance.now() + INVU_MS;
-      updateHudLevel();
-      transitionToGame();
+      danceTimer = 0;
+      updateHud();
+      goPlaying();         // show game canvas, stop BGM
       break;
 
-    case "state":
-      // Every-frame sync
+    case "STATE":
       if (pkt.player)  player  = pkt.player;
-      if (pkt.enemies) enemies = pkt.enemies;
+      if (pkt.enemies) enemies = pkt.enemies;   // already serialised lightly
       if (pkt.pings)   pings   = pkt.pings;
-      elapsed = pkt.elapsed ?? elapsed;
-      updateTimer(elapsed);
-      if (pkt.appState && pkt.appState !== appState) {
-        appState = pkt.appState;
+      if (pkt.elapsed !== undefined) { elapsed = pkt.elapsed; updateTimer(elapsed); }
+      // Sync appState only for terminal states (WIN/DEAD/DANCING)
+      if (pkt.appState && pkt.appState !== gs &&
+          [GS.WIN, GS.DEAD, GS.DANCING].includes(pkt.appState)) {
+        gs = pkt.appState;
         syncOverlays();
       }
       break;
 
-    case "event":
-      handleRemoteEvent(pkt);
+    case "LOAD_LEVEL":
+      maze     = pkt.maze;
+      levelIdx = pkt.levelIdx ?? levelIdx;
+      enemies  = (pkt.enemies || []).map(deserEnemy);
+      pings    = [];
+      elapsed  = 0;
+      player   = { x: pkt.spawn.x, y: pkt.spawn.y, vx: 0, vy: 0, angle: 0 };
+      invuUntil = performance.now() + INVU_MS;
+      danceTimer = 0;
+      updateHud();
+      gs = GS.PLAYING;
+      syncOverlays();
       break;
 
-    case "loadLevel":
-      // Host asks Mover to prepare for a new level
-      maze    = pkt.maze;
-      player  = pkt.player;
-      enemies = pkt.enemies;
-      pings   = [];
-      elapsed = 0;
-      levelIdx = pkt.levelIdx;
-      invuUntil = performance.now() + INVU_MS;
-      updateHudLevel();
-      appState = S.PLAYING;
-      syncOverlays();
+    case "EVENT":
+      if (pkt.evt === "win")   { playSfx(sfxWin); }
+      if (pkt.evt === "death") { playSfx(sfxDeath); }
+      if (pkt.evt === "ping")  { playSfx(sfxPing); }
       break;
   }
 }
 
-function handleRemoteEvent(pkt) {
-  if (pkt.evt === "win")   triggerWin(false);
-  if (pkt.evt === "death") triggerDeath(false);
-  if (pkt.evt === "ping")  playSfx(sfxPing);
+// Serialise enemy for network (strip heavy patrol array after first send)
+function serEnemy(e) {
+  return { x: e.x, y: e.y, vx: e.vx, vy: e.vy,
+           aggro: e.aggro, aggroEnabled: e.aggroEnabled,
+           patrolPath: e.patrolPath, patrolIdx: e.patrolIdx };
+}
+function deserEnemy(e) {
+  return { ...e };
 }
 
-// ── BROADCAST HELPERS ─────────────────────────────────────────────
+// ── BROADCAST ─────────────────────────────────────────────────────
 
-let lastStateSend = 0;
-function sendState() {
+let lastSend = 0;
+function broadcastState() {
   if (!dataConn?.open) return;
   const now = performance.now();
-  if (now - lastStateSend < 16) return; // ~60fps cap
-  lastStateSend = now;
+  if (now - lastSend < 16) return;
+  lastSend = now;
   dataConn.send({
-    type: "state",
+    type: "STATE",
     player,
     enemies: enemies.map(e => ({ x:e.x, y:e.y, aggro:e.aggro })),
     pings,
     elapsed,
-    appState,
+    appState: gs,
   });
 }
 
 function sendEvent(evt, extra = {}) {
-  dataConn?.open && dataConn.send({ type:"event", evt, ...extra });
+  dataConn?.open && dataConn.send({ type: "EVENT", evt, ...extra });
 }
 
-function buildLevelPacket() {
-  return {
-    type: "levelData",
-    levelIdx,
-    maze,
-    player: { ...player },
-    enemies: enemies.map(e => ({ x:e.x, y:e.y, aggro:false,
-                                 patrolPath:e.patrolPath, patrolIdx:e.patrolIdx })),
-  };
+function sendLoadLevel() {
+  if (!dataConn?.open) return;
+  dataConn.send({
+    type:     "LOAD_LEVEL",
+    levelIdx: levelIdx,
+    maze:     maze,
+    spawn:    { x: player.x, y: player.y },
+    enemies:  enemies.map(serEnemy),
+  });
 }
 
-// ───────────────────────────────────────────────────────────────────
-//  LEVEL INIT  (Host only — Mover receives via network)
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
+//  LEVEL INIT  (runs on Host; Mover gets data via network)
+// ─────────────────────────────────────────────────────────────────
 
-function initLevel(idx) {
+function prepareLevel(idx) {
   const cfg = LEVELS[Math.min(idx, LEVELS.length - 1)];
-  maze = buildMaze(cfg.seed, cfg.loops);
-
-  // Player spawn: top-left open cell
-  player = { x: 1 * TILE + TILE/2, y: 1 * TILE + TILE/2, vx:0, vy:0, angle:0 };
-
-  // Enemies: spawn on floor cells at least SPAWN_MIN_DIST from player
-  enemies = spawnEnemies(cfg.enemies, cfg.seed + 9999, cfg.aggroOn);
-
-  pings     = [];
-  elapsed   = 0;
-  invuUntil = performance.now() + INVU_MS;
+  maze    = buildMaze(cfg.seed, cfg.loops);
+  player  = { x: 1 * TILE + TILE / 2, y: 1 * TILE + TILE / 2, vx: 0, vy: 0, angle: 0 };
+  enemies = spawnEnemies(cfg.enemies, cfg.seed + 8888, cfg.aggro);
+  pings   = [];
+  elapsed = 0;
+  invuUntil  = performance.now() + INVU_MS;
   danceTimer = 0;
 }
 
 function spawnEnemies(count, seed, aggroEnabled) {
-  const rng = mulberry32(seed);
+  const rng  = rngFactory(seed);
   const list = [];
   const px = player.x, py = player.y;
 
-  // Collect all floor cells far from player
-  const candidates = [];
+  // Build pool of safe floor cells
+  const pool = [];
   for (let r = 0; r < ROWS; r++) {
     for (let c = 0; c < COLS; c++) {
       if (maze[r][c] !== 0) continue;
-      const ex = c * TILE + TILE/2, ey = r * TILE + TILE/2;
-      // ── SPAWN SAFETY FIX ───────────────────────────────────────
-      if (Math.hypot(ex - px, ey - py) >= SPAWN_MIN_DIST) {
-        candidates.push({ c, r, ex, ey });
+      const ex = c * TILE + TILE / 2, ey = r * TILE + TILE / 2;
+      if (Math.hypot(ex - px, ey - py) >= SPAWN_MIN_D) {
+        pool.push({ c, r, ex, ey });
       }
     }
   }
 
-  // Shuffle
-  for (let i = candidates.length - 1; i > 0; i--) {
+  // Fisher-Yates shuffle
+  for (let i = pool.length - 1; i > 0; i--) {
     const j = Math.floor(rng() * (i + 1));
-    [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
+    [pool[i], pool[j]] = [pool[j], pool[i]];
   }
 
-  for (let i = 0; i < Math.min(count, candidates.length); i++) {
-    const { c, r, ex, ey } = candidates[i];
+  for (let i = 0; i < Math.min(count, pool.length); i++) {
+    const { c, r, ex, ey } = pool[i];
     list.push({
       x: ex, y: ey, vx: 0, vy: 0,
-      aggro: false,
-      aggroEnabled,
-      patrolPath: buildPatrol(c, r, mulberry32(seed + i)),
-      patrolIdx:  0,
+      aggro: false, aggroEnabled,
+      patrolPath: buildPatrol(c, r, rngFactory(seed + i * 17)),
+      patrolIdx: 0,
     });
   }
   return list;
@@ -484,8 +508,8 @@ function spawnEnemies(count, seed, aggroEnabled) {
 function buildPatrol(sc, sr, rng) {
   const path = [{ c: sc, r: sr }];
   let c = sc, r = sr;
-  for (let step = 0; step < 8; step++) {
-    const dirs = [[0,-2],[0,2],[-2,0],[2,0]].sort(() => rng() - 0.5);
+  for (let step = 0; step < 9; step++) {
+    const dirs = [[0,-1],[0,1],[-1,0],[1,0]].sort(() => rng() - 0.5);
     for (const [dc, dr] of dirs) {
       const nc = c + dc, nr = r + dr;
       if (nc > 0 && nc < COLS-1 && nr > 0 && nr < ROWS-1 && maze[nr]?.[nc] === 0) {
@@ -498,16 +522,16 @@ function buildPatrol(sc, sr, rng) {
   return path;
 }
 
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 //  SCREEN TRANSITIONS
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 
-function transitionToGame() {
-  stopBgm();                     // ── AUDIO FIX: stop BGM on game start
-  showScreen("game-screen");
-  el("hud-role").textContent = role === "host" ? "HOST" : "MOVER";
-  updateHudLevel();
-  appState = S.PLAYING;
+function goPlaying() {
+  stopBgm();                         // ← stop BGM the moment game starts
+  showScreen("screen-game");
+  g("h-role").textContent = role === "host" ? "HOST" : "MOVER";
+  updateHud();
+  gs = GS.PLAYING;
   syncOverlays();
 }
 
@@ -516,140 +540,172 @@ function showScreen(id) {
     s.classList.remove("active");
     s.classList.add("hidden");
   });
-  const t = el(id);
+  const t = g(id);
   t.classList.remove("hidden");
   t.classList.add("active");
 }
 
 function syncOverlays() {
-  setHidden("ov-pause", appState !== S.PAUSED);
-  setHidden("ov-win",   appState !== S.WIN);
-  setHidden("ov-death", appState !== S.DEAD);
+  hide("ov-pause", gs !== GS.PAUSED);
+  hide("ov-win",   gs !== GS.WIN);
+  hide("ov-death", gs !== GS.DEAD);
 }
 
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
+//  PAUSE / LEAVE
+// ─────────────────────────────────────────────────────────────────
+
+function onEsc() {
+  if (gs === GS.PLAYING) {
+    gs = GS.PAUSED;
+    syncOverlays();
+  } else if (gs === GS.PAUSED) {
+    gs = GS.PLAYING;
+    prevTs = performance.now();
+    syncOverlays();
+  }
+}
+
+function leaveGame() {
+  try { dataConn?.close(); } catch (_) {}
+  try { mediaConn?.close(); } catch (_) {}
+  try { peer?.destroy(); }    catch (_) {}
+  location.reload();
+}
+
+// Wire all "leave" buttons
+["btn-leave-pause", "btn-leave-win", "btn-leave-death"].forEach(id => {
+  g(id).addEventListener("click", leaveGame);
+});
+
+g("btn-resume").addEventListener("click", () => {
+  if (gs === GS.PAUSED) {
+    gs = GS.PLAYING;
+    prevTs = performance.now();
+    syncOverlays();
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────
 //  GAME LOOP
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 
 let prevTs = performance.now();
 
-function gameLoop(ts) {
+function loop(ts) {
   const dt = Math.min((ts - prevTs) / 1000, 0.05);
   prevTs = ts;
 
-  if (appState === S.PLAYING) {
+  if (gs === GS.PLAYING) {
     if (role === "host") {
-      updatePhysics(dt);
-      sendState();
+      tick(dt);
+      broadcastState();
     }
     if (role === "mover" && dataConn?.open) {
-      dataConn.send({ type:"input", keys:{ ...localKeys } });
+      dataConn.send({ type: "INPUT", keys: { ...localKeys } });
     }
   }
 
-  if (appState === S.DANCING) {
+  if (gs === GS.DANCING) {
     danceTimer += dt;
-    if (danceTimer > 1.8) {
-      appState = S.WIN;
+    if (danceTimer > 1.85) {
+      gs = GS.WIN;
       syncOverlays();
-      el("ov-win-time").textContent = `Escaped in ${fmtTime(elapsed)}`;
+      g("ov-win-time").textContent = `Escaped in ${fmt(elapsed)}`;
     }
-    if (role === "host") sendState();
+    if (role === "host") broadcastState();
   }
 
-  draw();
-  requestAnimationFrame(gameLoop);
+  render();
+  requestAnimationFrame(loop);
 }
 
-// ───────────────────────────────────────────────────────────────────
-//  PHYSICS  (Host-authoritative)
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
+//  PHYSICS / AI  (Host-authoritative)
+// ─────────────────────────────────────────────────────────────────
 
-const EXIT_X = (COLS-2) * TILE + TILE/2;
-const EXIT_Y = (ROWS-2) * TILE + TILE/2;
-
-function updatePhysics(dt) {
+function tick(dt) {
   elapsed += dt;
   updateTimer(elapsed);
 
-  const input = remoteKeys; // Mover's input
-  const lvlSpeedMult = 1 + levelIdx * 0.08;
+  const inp = remoteKeys;
+  const lvlM = 1 + levelIdx * 0.09;
 
-  // ── Player movement ──
-  const dx = boolAxis(input, "ArrowRight","KeyD") - boolAxis(input,"ArrowLeft","KeyA");
-  const dy = boolAxis(input, "ArrowDown", "KeyS") - boolAxis(input,"ArrowUp",  "KeyW");
-  const len = Math.hypot(dx, dy) || 1;
-  const norm = (dx || dy) ? 1/len : 0;
+  // ── Player ──────────────────────────────────────────────────────
+  const dx = axis(inp,"ArrowRight","KeyD") - axis(inp,"ArrowLeft","KeyA");
+  const dy = axis(inp,"ArrowDown","KeyS")  - axis(inp,"ArrowUp","KeyW");
+  const dl = Math.hypot(dx, dy) || 1;
+  const norm = (dx || dy) ? 1 / dl : 0;
   player.vx = dx * norm * PLAYER_SPEED;
   player.vy = dy * norm * PLAYER_SPEED;
   if (dx || dy) player.angle = Math.atan2(dy, dx);
 
-  player.x = slideAxis(player.x, player.vx * dt, player.y, false);
-  player.y = slideAxis(player.y, player.vy * dt, player.x, true);
+  player.x = slide(player.x, player.vx * dt, player.y, false);
+  player.y = slide(player.y, player.vy * dt, player.x, true);
 
-  // ── Enemies ──
+  // ── Enemies ─────────────────────────────────────────────────────
   for (const e of enemies) {
     const dist = Math.hypot(player.x - e.x, player.y - e.y);
     e.aggro = e.aggroEnabled && dist < SENSE_R;
-    const spd = ENEMY_BASE_SPD * lvlSpeedMult * (e.aggro ? ENEMY_AGGRO_M : 1);
+    const spd = ENEMY_BASE_SPD * lvlM * (e.aggro ? ENEMY_AGGRO_M : 1);
 
     if (e.aggro) {
       const d = dist || 1;
       e.vx = ((player.x - e.x) / d) * spd;
       e.vy = ((player.y - e.y) / d) * spd;
-    } else if (e.patrolPath.length > 0) {
-      const pt = e.patrolPath[e.patrolIdx % e.patrolPath.length];
-      const tx = pt.c * TILE + TILE/2, ty = pt.r * TILE + TILE/2;
-      const pd = Math.hypot(tx - e.x, ty - e.y);
-      if (pd < 4) {
-        e.patrolIdx = (e.patrolIdx + 1) % e.patrolPath.length;
-      } else {
-        e.vx = ((tx - e.x) / pd) * spd;
-        e.vy = ((ty - e.y) / pd) * spd;
+    } else {
+      const pt = e.patrolPath?.[e.patrolIdx % (e.patrolPath?.length || 1)];
+      if (pt) {
+        const tx = pt.c * TILE + TILE / 2, ty = pt.r * TILE + TILE / 2;
+        const pd = Math.hypot(tx - e.x, ty - e.y);
+        if (pd < 4) {
+          e.patrolIdx = (e.patrolIdx + 1) % e.patrolPath.length;
+        } else {
+          e.vx = ((tx - e.x) / pd) * spd;
+          e.vy = ((ty - e.y) / pd) * spd;
+        }
       }
     }
-    e.x = slideAxis(e.x, e.vx * dt, e.y, false);
-    e.y = slideAxis(e.y, e.vy * dt, e.x, true);
+    e.x = slide(e.x, e.vx * dt, e.y, false);
+    e.y = slide(e.y, e.vy * dt, e.x, true);
   }
 
-  // Expire old pings
-  pings = pings.filter(p => elapsed - p.born < 2.2);
+  // Expire pings
+  pings = pings.filter(p => elapsed - p.born < 2.3);
 
-  // ── Win check ──
-  if (Math.hypot(player.x - EXIT_X, player.y - EXIT_Y) < TILE * 0.6) {
-    triggerWin(true);
+  // ── Win ──────────────────────────────────────────────────────────
+  if (Math.hypot(player.x - EXIT_X, player.y - EXIT_Y) < TILE * 0.62) {
+    triggerWin();
     return;
   }
 
-  // ── Death check (with invulnerability window) ──
+  // ── Death (with invulnerability window) ──────────────────────────
   if (performance.now() > invuUntil) {
     for (const e of enemies) {
       if (Math.hypot(player.x - e.x, player.y - e.y) < PLAYER_R + ENEMY_R) {
-        triggerDeath(true);
+        triggerDeath();
         return;
       }
     }
   }
 }
 
-function boolAxis(keys, a, b) { return (keys[a] || keys[b]) ? 1 : 0; }
+// ─────────────────────────────────────────────────────────────────
+//  COLLISION
+// ─────────────────────────────────────────────────────────────────
 
-// Axis-separated sliding collision
-function slideAxis(pos, vel, crossPos, isY) {
-  if (vel === 0) return pos;
-  const next  = pos + vel;
-  const half  = PLAYER_R * 0.88; // shrink slightly for smoother sliding
-  const cross = crossPos;
+function slide(pos, vel, cross, isY) {
+  if (!vel) return pos;
+  const next = pos + vel;
+  const hr   = PLAYER_R * 0.87;
 
   const checks = isY
-    ? [[cross - half + 2, next - half], [cross + half - 2, next - half],
-       [cross - half + 2, next + half], [cross + half - 2, next + half]]
-    : [[next - half, cross - half + 2], [next - half, cross + half - 2],
-       [next + half, cross - half + 2], [next + half, cross + half - 2]];
+    ? [[cross - hr + 2, next - hr],[cross + hr - 2, next - hr],
+       [cross - hr + 2, next + hr],[cross + hr - 2, next + hr]]
+    : [[next - hr, cross - hr + 2],[next - hr, cross + hr - 2],
+       [next + hr, cross - hr + 2],[next + hr, cross + hr - 2]];
 
-  for (const [wx, wy] of checks) {
-    if (solidAt(wx, wy)) return pos;
-  }
+  for (const [wx, wy] of checks) if (solidAt(wx, wy)) return pos;
   return next;
 }
 
@@ -659,267 +715,232 @@ function solidAt(wx, wy) {
   return maze[r][c] === 1;
 }
 
-// ───────────────────────────────────────────────────────────────────
-//  WIN / DEATH / PAUSE
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
+//  WIN / DEATH / NEXT / RETRY
+// ─────────────────────────────────────────────────────────────────
 
-function triggerWin(isAuthority) {
-  if (appState === S.WIN || appState === S.DANCING) return;
-  playSfx(sfxWin);
+function triggerWin() {
+  if (gs === GS.WIN || gs === GS.DANCING) return;
+  gs = GS.DANCING;
   danceTimer = 0;
-  appState   = S.DANCING;          // start victory dance
-  if (isAuthority) sendEvent("win");
+  playSfx(sfxWin);
+  sendEvent("win");
 }
 
-function triggerDeath(isAuthority) {
-  if (appState === S.DEAD) return;
-  playSfx(sfxDeath);
-  appState = S.DEAD;
+function triggerDeath() {
+  if (gs === GS.DEAD) return;
+  gs = GS.DEAD;
   syncOverlays();
-  if (isAuthority) sendEvent("death");
+  playSfx(sfxDeath);
+  sendEvent("death");
 }
 
-function onEsc() {
-  if (appState === S.PLAYING) {
-    appState = S.PAUSED;
-    syncOverlays();
-  } else if (appState === S.PAUSED) {
-    appState = S.PLAYING;
-    prevTs   = performance.now();
-    syncOverlays();
-  }
-}
-
-// ───────────────────────────────────────────────────────────────────
-//  NEXT LEVEL / RETRY  (Host-driven, Mover follows via network)
-// ───────────────────────────────────────────────────────────────────
-
-el("btn-next-level").addEventListener("click", () => {
+g("btn-next").addEventListener("click", () => {
   if (role !== "host") return;
   levelIdx = Math.min(levelIdx + 1, LEVELS.length - 1);
-  initLevel(levelIdx);
-  updateHudLevel();
-  appState = S.PLAYING;
+  prepareLevel(levelIdx);
+  updateHud();
+  gs = GS.PLAYING;
   syncOverlays();
-  if (dataConn?.open) {
-    const pkt = buildLevelPacket();
-    pkt.type = "loadLevel";
-    dataConn.send(pkt);
-  }
+  sendLoadLevel();
 });
 
-el("btn-retry").addEventListener("click", () => {
+g("btn-retry").addEventListener("click", () => {
   if (role !== "host") return;
-  initLevel(levelIdx);
-  updateHudLevel();
-  appState = S.PLAYING;
+  prepareLevel(levelIdx);
+  updateHud();
+  gs = GS.PLAYING;
   syncOverlays();
-  if (dataConn?.open) {
-    const pkt = buildLevelPacket();
-    pkt.type = "loadLevel";
-    dataConn.send(pkt);
-  }
+  sendLoadLevel();
 });
 
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 //  HOST CLICK → PING
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 
 canvas.addEventListener("click", e => {
-  if (role !== "host" || appState !== S.PLAYING) return;
-  const rect  = canvas.getBoundingClientRect();
-  const sx = e.clientX - rect.left;
-  const sy = e.clientY - rect.top;
-  const { ox, oy, scale } = hostViewTransform();
-  const mx = (sx - ox) / scale;
-  const my = (sy - oy) / scale;
-  if (mx < 0 || my < 0 || mx > W || my > H) return;
-  pings.push({ x:mx, y:my, born:elapsed, id: pingCounter++ });
+  if (role !== "host" || gs !== GS.PLAYING) return;
+  const rect = canvas.getBoundingClientRect();
+  const sx   = e.clientX - rect.left;
+  const sy   = e.clientY - rect.top;
+  const { ox, oy, sc } = hostTransform();
+  const mx = (sx - ox) / sc;
+  const my = (sy - oy) / sc;
+  if (mx < 0 || my < 0 || mx > MW || my > MH) return;
+  pings.push({ x: mx, y: my, born: elapsed, id: pingCtr++ });
   playSfx(sfxPing);
   sendEvent("ping");
 });
 
-function hostViewTransform() {
-  const scale = Math.min(canvas.width / W, canvas.height / H);
-  const ox    = (canvas.width  - W * scale) / 2;
-  const oy    = (canvas.height - H * scale) / 2;
-  return { ox, oy, scale };
+function hostTransform() {
+  const sc = Math.min(canvas.width / MW, canvas.height / MH);
+  const ox = (canvas.width  - MW * sc) / 2;
+  const oy = (canvas.height - MH * sc) / 2;
+  return { ox, oy, sc };
 }
 
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 //  RENDERER
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 
-function draw() {
+function render() {
   if (!maze || !player) return;
   const cw = canvas.width, ch = canvas.height;
   ctx.clearRect(0, 0, cw, ch);
 
   if (role === "host") {
-    const { ox, oy, scale } = hostViewTransform();
+    const { ox, oy, sc } = hostTransform();
     ctx.save();
     ctx.translate(ox, oy);
-    ctx.scale(scale, scale);
-    drawWorld(false);
+    ctx.scale(sc, sc);
+    drawWorld();
     ctx.restore();
   } else {
     drawMoverView(cw, ch);
   }
 }
 
-// ── HOST VIEW — full map ──────────────────────────────────────────
-function drawWorld(isMoverFog) {
-  // Background
-  ctx.fillStyle = C.bg;
-  ctx.fillRect(0, 0, W, H);
+// ── Full world (Host sees this, Mover sees it through fog) ────────
+function drawWorld() {
+  ctx.fillStyle = CLR.bg;
+  ctx.fillRect(0, 0, MW, MH);
 
   // Tiles
   for (let r = 0; r < ROWS; r++) {
     for (let c = 0; c < COLS; c++) {
       if (maze[r][c] === 1) drawWall(c * TILE, r * TILE);
-      else {
-        ctx.fillStyle = C.floor;
-        ctx.fillRect(c * TILE, r * TILE, TILE, TILE);
-      }
+      else { ctx.fillStyle = CLR.floor; ctx.fillRect(c * TILE, r * TILE, TILE, TILE); }
     }
   }
 
   drawExit();
-
-  for (const p of pings) drawPing(p);
+  for (const p of pings)   drawPing(p);
   for (const e of enemies) drawGhost(e);
-
-  // Player
-  const dancing = appState === S.DANCING;
-  drawPlayerChar(player.x, player.y, player.angle, dancing);
+  drawPlayer(player.x, player.y, player.angle, gs === GS.DANCING);
 }
 
-// ── MOVER VIEW — fog of war ───────────────────────────────────────
+// ── Mover view with fog-of-war ────────────────────────────────────
 function drawMoverView(cw, ch) {
   const px = player.x, py = player.y;
-
-  // Camera offset so player is centred
+  // ── Camera centered on player (spawn fix) ──
   const ox = cw / 2 - px;
   const oy = ch / 2 - py;
 
-  // 1. Draw world into an offscreen buffer — or just translate
   ctx.save();
   ctx.translate(ox, oy);
 
-  drawWorld(true);
+  drawWorld();
 
-  // 2. Fog mask (destination-in = keep only inside the gradient)
+  // Fog mask
   ctx.globalCompositeOperation = "destination-in";
-  const fog = ctx.createRadialGradient(px, py, FOG_R * 0.15, px, py, FOG_R);
-  fog.addColorStop(0,   "rgba(0,0,0,1)");
-  fog.addColorStop(0.72,"rgba(0,0,0,1)");
-  fog.addColorStop(1,   "rgba(0,0,0,0)");
+  const fog = ctx.createRadialGradient(px, py, FOG_R * 0.14, px, py, FOG_R);
+  fog.addColorStop(0,    "rgba(0,0,0,1)");
+  fog.addColorStop(0.72, "rgba(0,0,0,1)");
+  fog.addColorStop(1,    "rgba(0,0,0,0)");
   ctx.fillStyle = fog;
   ctx.fillRect(-ox, -oy, cw, ch);
 
   ctx.globalCompositeOperation = "source-over";
 
-  // 3. Outer darkness beyond fog edge
-  const outer = ctx.createRadialGradient(px, py, FOG_R * 0.8, px, py, FOG_R * 2.2);
-  outer.addColorStop(0, "rgba(3,3,14,0)");
-  outer.addColorStop(1, "rgba(3,3,14,1)");
-  ctx.fillStyle = outer;
+  // Outer darkness
+  const dark = ctx.createRadialGradient(px, py, FOG_R * 0.78, px, py, FOG_R * 2.4);
+  dark.addColorStop(0, "rgba(4,4,14,0)");
+  dark.addColorStop(1, "rgba(4,4,14,1)");
+  ctx.fillStyle = dark;
   ctx.fillRect(-ox, -oy, cw, ch);
 
   ctx.restore();
 }
 
-// ── DRAW HELPERS ─────────────────────────────────────────────────
+// ── Draw helpers ──────────────────────────────────────────────────
 
 function drawWall(x, y) {
-  ctx.fillStyle = C.wall;
+  // Dark purple fill
+  ctx.fillStyle = CLR.wall;
   ctx.fillRect(x, y, TILE, TILE);
+  // Neon purple glowing edge
   ctx.save();
-  ctx.strokeStyle = C.wallGlow;
-  ctx.lineWidth   = 1.5;
-  ctx.shadowColor = "#1535a0";
-  ctx.shadowBlur  = 7;
+  ctx.strokeStyle = CLR.wallGlow;
+  ctx.lineWidth   = 1.6;
+  ctx.shadowColor = CLR.wallGlow;
+  ctx.shadowBlur  = 9;
   ctx.strokeRect(x + 1.5, y + 1.5, TILE - 3, TILE - 3);
   ctx.restore();
 }
 
 function drawExit() {
-  const x = (COLS-2) * TILE, y = (ROWS-2) * TILE;
+  const x = EXIT_C * TILE, y = EXIT_R * TILE;
   const pulse = 0.5 + 0.5 * Math.sin(elapsed * 3.2);
   ctx.save();
-  ctx.shadowColor = C.exit;
-  ctx.shadowBlur  = 20 + pulse * 16;
-  ctx.fillStyle   = `rgba(57,255,20,${0.12 + pulse * 0.22})`;
+  ctx.shadowColor = CLR.exit;
+  ctx.shadowBlur  = 20 + pulse * 18;
+  ctx.fillStyle   = `rgba(57,255,20,${0.11 + pulse * 0.22})`;
   ctx.fillRect(x + 3, y + 3, TILE - 6, TILE - 6);
-  ctx.strokeStyle = C.exit;
-  ctx.lineWidth   = 2.5;
+  ctx.strokeStyle  = CLR.exit;
+  ctx.lineWidth    = 2.5;
   ctx.strokeRect(x + 4, y + 4, TILE - 8, TILE - 8);
-  ctx.fillStyle    = C.exit;
-  ctx.font         = `bold ${TILE * 0.52}px monospace`;
+  ctx.fillStyle    = CLR.exit;
+  ctx.font         = `bold ${TILE * 0.5}px monospace`;
   ctx.textAlign    = "center";
   ctx.textBaseline = "middle";
-  ctx.fillText("▶", x + TILE/2, y + TILE/2);
+  ctx.fillText("▶", x + TILE / 2, y + TILE / 2);
   ctx.restore();
 }
 
-// ── PLAYER (cyan humanoid) ────────────────────────────────────────
-function drawPlayerChar(px, py, angle, dancing) {
-  const t  = elapsed;
-  const r  = PLAYER_R;
+function drawPlayer(px, py, angle, dancing) {
+  const r = PLAYER_R;
+  const t = elapsed;
 
   ctx.save();
   ctx.translate(px, py);
 
   if (dancing) {
-    // Victory Dance: spin + pulse
-    const spin  = danceTimer * 5;
-    const scale = 1 + 0.22 * Math.sin(danceTimer * 14);
-    ctx.rotate(spin);
-    ctx.scale(scale, scale);
+    ctx.rotate(danceTimer * 5.2);
+    const ps = 1 + 0.24 * Math.sin(danceTimer * 14);
+    ctx.scale(ps, ps);
   }
 
-  ctx.shadowColor = C.player;
+  ctx.shadowColor = CLR.player;
   ctx.shadowBlur  = 22 + 8 * Math.sin(t * 4);
 
-  // Body (circle + glow layers)
-  const bodyGrad = ctx.createRadialGradient(-r*0.2, -r*0.2, r*0.05, 0, 0, r);
-  bodyGrad.addColorStop(0, "#aaffff");
-  bodyGrad.addColorStop(0.5, C.player);
-  bodyGrad.addColorStop(1, "#0077aa");
+  // Body gradient
+  const g2 = ctx.createRadialGradient(-r * 0.2, -r * 0.2, r * 0.04, 0, 0, r);
+  g2.addColorStop(0,   "#aaffff");
+  g2.addColorStop(0.5, CLR.player);
+  g2.addColorStop(1,   "#0077aa");
   ctx.beginPath();
   ctx.arc(0, 0, r, 0, Math.PI * 2);
-  ctx.fillStyle = bodyGrad;
+  ctx.fillStyle = g2;
   ctx.fill();
 
-  // Head "eyes"
-  ctx.fillStyle  = "#fff";
+  // Eyes
   ctx.shadowBlur = 0;
+  ctx.fillStyle  = "#fff";
   ctx.beginPath();
-  ctx.arc(-r*0.28, -r*0.22, r*0.18, 0, Math.PI*2);
-  ctx.arc( r*0.28, -r*0.22, r*0.18, 0, Math.PI*2);
+  ctx.arc(-r * 0.27, -r * 0.22, r * 0.18, 0, Math.PI * 2);
+  ctx.arc( r * 0.27, -r * 0.22, r * 0.18, 0, Math.PI * 2);
   ctx.fill();
 
-  // Pupils
   ctx.fillStyle = "#003344";
   ctx.beginPath();
-  ctx.arc(-r*0.28, -r*0.22, r*0.08, 0, Math.PI*2);
-  ctx.arc( r*0.28, -r*0.22, r*0.08, 0, Math.PI*2);
+  ctx.arc(-r * 0.27, -r * 0.22, r * 0.08, 0, Math.PI * 2);
+  ctx.arc( r * 0.27, -r * 0.22, r * 0.08, 0, Math.PI * 2);
   ctx.fill();
 
-  // Inner glow highlight
+  // Highlight
   ctx.beginPath();
-  ctx.arc(-r*0.18, -r*0.18, r*0.28, 0, Math.PI*2);
-  ctx.fillStyle = "rgba(255,255,255,0.22)";
+  ctx.arc(-r * 0.18, -r * 0.18, r * 0.28, 0, Math.PI * 2);
+  ctx.fillStyle = "rgba(255,255,255,0.2)";
   ctx.fill();
 
-  // Dancing sparkles
+  // Victory sparkles
   if (dancing) {
-    for (let i = 0; i < 6; i++) {
-      const a   = (i / 6) * Math.PI * 2 + danceTimer * 3;
-      const rad = r * 1.6 + 4 * Math.sin(danceTimer * 8 + i);
+    for (let i = 0; i < 7; i++) {
+      const a   = (i / 7) * Math.PI * 2 + danceTimer * 3.2;
+      const rad = r * 1.7 + 5 * Math.sin(danceTimer * 9 + i);
       ctx.beginPath();
-      ctx.arc(Math.cos(a)*rad, Math.sin(a)*rad, 3, 0, Math.PI*2);
-      ctx.fillStyle = `hsl(${(i*60 + t*120) % 360},100%,70%)`;
+      ctx.arc(Math.cos(a) * rad, Math.sin(a) * rad, 3.2, 0, Math.PI * 2);
+      ctx.fillStyle   = `hsl(${(i * 51 + t * 120) % 360},100%,68%)`;
       ctx.shadowColor = ctx.fillStyle;
       ctx.shadowBlur  = 10;
       ctx.fill();
@@ -929,143 +950,136 @@ function drawPlayerChar(px, py, angle, dancing) {
   ctx.restore();
 }
 
-// ── GHOST (enemy) ─────────────────────────────────────────────────
 function drawGhost(e) {
   const t = elapsed;
   const gx = e.x, gy = e.y;
-  const w  = TILE * 0.70, h = TILE * 0.76;
-  const waves = 4;
+  const w = TILE * 0.7, h = TILE * 0.76;
 
   ctx.save();
-  ctx.shadowColor = C.enemy;
-  ctx.shadowBlur  = e.aggro ? 30 + 10 * Math.sin(t * 9) : 14;
-  ctx.fillStyle   = e.aggro ? "#ff0022" : C.enemy;
+  ctx.shadowColor = CLR.enemy;
+  ctx.shadowBlur  = e.aggro ? 32 + 10 * Math.sin(t * 9) : 14;
+  ctx.fillStyle   = e.aggro ? "#ff0020" : CLR.enemy;
 
   ctx.beginPath();
   ctx.arc(gx, gy - h * 0.08, w / 2, Math.PI, 0);
-  ctx.lineTo(gx + w/2, gy + h * 0.42);
-  for (let i = 0; i < waves; i++) {
-    const wx1 = gx + w/2 - (w/waves)*(i+0.5);
-    const wx2 = gx + w/2 - (w/waves)*(i+1);
+  ctx.lineTo(gx + w / 2, gy + h * 0.42);
+  for (let i = 0; i < 4; i++) {
+    const wx1 = gx + w/2 - (w/4)*(i+0.5);
+    const wx2 = gx + w/2 - (w/4)*(i+1);
     const wy  = gy + h*0.42 + (i%2===0?1:-1)*(TILE*0.12 + 0.07*Math.sin(t*5+i));
-    ctx.quadraticCurveTo(wx1, wy, wx2, gy + h*0.42);
+    ctx.quadraticCurveTo(wx1, wy, wx2, gy + h * 0.42);
   }
   ctx.closePath();
   ctx.fill();
 
   // Eyes
-  ctx.fillStyle  = "#fff";
-  ctx.shadowBlur = 0;
+  ctx.fillStyle = "#fff"; ctx.shadowBlur = 0;
   ctx.beginPath();
-  ctx.arc(gx - w*0.19, gy - h*0.14, w*0.115, 0, Math.PI*2);
-  ctx.arc(gx + w*0.19, gy - h*0.14, w*0.115, 0, Math.PI*2);
+  ctx.arc(gx - w*0.19, gy - h*0.13, w*0.11, 0, Math.PI*2);
+  ctx.arc(gx + w*0.19, gy - h*0.13, w*0.11, 0, Math.PI*2);
   ctx.fill();
 
   ctx.fillStyle = e.aggro ? "#ff0000" : "#110022";
   ctx.beginPath();
-  ctx.arc(gx - w*0.19, gy - h*0.14, w*0.055, 0, Math.PI*2);
-  ctx.arc(gx + w*0.19, gy - h*0.14, w*0.055, 0, Math.PI*2);
+  ctx.arc(gx - w*0.19, gy - h*0.13, w*0.052, 0, Math.PI*2);
+  ctx.arc(gx + w*0.19, gy - h*0.13, w*0.052, 0, Math.PI*2);
   ctx.fill();
 
   ctx.restore();
 }
 
-// ── PING (ripple) ─────────────────────────────────────────────────
 function drawPing({ x, y, born }) {
-  const progress = (elapsed - born) / 2.2;
+  const progress = (elapsed - born) / 2.3;
   if (progress >= 1) return;
-
   ctx.save();
   for (let ring = 0; ring < 3; ring++) {
-    const rp    = (progress + ring * 0.18) % 1;
-    const rad   = rp * TILE * 2.8;
-    const alpha = (1 - rp) * 0.85;
+    const rp  = (progress + ring * 0.18) % 1;
+    const rad = rp * TILE * 2.9;
+    const al  = (1 - rp) * 0.85;
     ctx.beginPath();
-    ctx.arc(x, y, rad, 0, Math.PI*2);
-    ctx.strokeStyle = `rgba(255,230,0,${alpha})`;
-    ctx.lineWidth   = 2.8 * (1-rp);
-    ctx.shadowColor = C.ping;
+    ctx.arc(x, y, rad, 0, Math.PI * 2);
+    ctx.strokeStyle = `rgba(255,230,0,${al})`;
+    ctx.lineWidth   = 2.8 * (1 - rp);
+    ctx.shadowColor = CLR.ping;
     ctx.shadowBlur  = 12;
     ctx.stroke();
   }
   ctx.beginPath();
-  ctx.arc(x, y, 4.5, 0, Math.PI*2);
-  ctx.fillStyle   = C.ping;
+  ctx.arc(x, y, 4.5, 0, Math.PI * 2);
+  ctx.fillStyle   = CLR.ping;
   ctx.shadowBlur  = 18;
-  ctx.shadowColor = C.ping;
+  ctx.shadowColor = CLR.ping;
   ctx.fill();
   ctx.restore();
 }
 
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 //  HUD HELPERS
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 
-function updateTimer(s) {
-  el("hud-timer").textContent = fmtTime(s);
+function updateTimer(s) { g("h-timer").textContent = fmt(s); }
+function updateHud() {
+  g("h-level").textContent = levelIdx + 1;
+  updateTimer(elapsed);
+}
+function fmt(s) {
+  return `${String(Math.floor(s/60)).padStart(2,"0")}:${String(Math.floor(s%60)).padStart(2,"0")}`;
 }
 
-function fmtTime(s) {
-  const m = Math.floor(s/60).toString().padStart(2,"0");
-  const sec = Math.floor(s%60).toString().padStart(2,"0");
-  return `${m}:${sec}`;
-}
-
-function updateHudLevel() {
-  el("hud-level").textContent = levelIdx + 1;
-}
-
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 //  MENU WIRING
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 
-el("btn-host").addEventListener("click", () => {
-  playBgm();                   // ── AUDIO FIX: start BGM on first interaction
-  setHidden("host-panel", false);
-  setHidden("join-panel",  true);
+g("btn-host").addEventListener("click", () => {
+  startBgm();                         // BGM on first interaction
+  show("panel-host");
+  hide("panel-join", true);
   initHost();
 });
 
-el("btn-join").addEventListener("click", () => {
-  playBgm();                   // ── AUDIO FIX: start BGM on first interaction
-  setHidden("join-panel",  false);
-  setHidden("host-panel",  true);
+g("btn-join").addEventListener("click", () => {
+  startBgm();                         // BGM on first interaction
+  show("panel-join");
+  hide("panel-host", true);
 });
 
-el("btn-connect").addEventListener("click", () => {
-  const id = el("room-code-input").value.trim().toUpperCase();
-  if (!id) return;
+g("btn-connect").addEventListener("click", () => {
+  const id = g("room-id-input").value.trim().toUpperCase();
+  if (!id) { setStatus("join","⚠ Please enter a Room ID!"); return; }
   initMover(id);
 });
 
-el("room-code-input").addEventListener("keydown", e => {
-  if (e.key === "Enter") el("btn-connect").click();
+g("room-id-input").addEventListener("keydown", e => {
+  if (e.key === "Enter") g("btn-connect").click();
 });
 
-el("btn-copy-code").addEventListener("click", () => {
-  const code = el("room-code-display").textContent;
+g("btn-copy").addEventListener("click", () => {
+  const code = g("room-id-display").textContent;
   navigator.clipboard.writeText(code).then(() => {
-    el("btn-copy-code").textContent = "COPIED ✓";
-    setTimeout(() => { el("btn-copy-code").textContent = "COPY ID"; }, 2000);
+    g("btn-copy").textContent = "COPIED ✓";
+    setTimeout(() => { g("btn-copy").textContent = "COPY ID"; }, 2000);
   });
 });
 
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 //  UTILITY
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
 
-function el(id) { return document.getElementById(id); }
-
-function setHidden(id, hidden) {
-  el(id).classList.toggle("hidden", hidden);
+function g(id)    { return document.getElementById(id); }
+function show(id) { g(id).classList.remove("hidden"); }
+function hide(id, force) {
+  if (force === undefined) g(id).classList.add("hidden");
+  else if (force) g(id).classList.add("hidden");
+  else            g(id).classList.remove("hidden");
 }
+function axis(keys, a, b) { return (keys[a] || keys[b]) ? 1 : 0; }
 
 function setStatus(who, msg) {
-  el(who === "host" ? "host-status" : "join-status").textContent = msg;
+  g(who === "host" ? "host-status" : "join-status").textContent = msg;
 }
 
-// ───────────────────────────────────────────────────────────────────
-//  KICK OFF RENDER LOOP
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────
+//  START RENDER LOOP
+// ─────────────────────────────────────────────────────────────────
 
-requestAnimationFrame(gameLoop);
+requestAnimationFrame(loop);
