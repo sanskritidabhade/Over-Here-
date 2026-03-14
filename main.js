@@ -4,44 +4,44 @@
  *  Vite + PeerJS P2P Networked Maze Game
  * ═══════════════════════════════════════════════════════════════════
  *
- *  HOST  = "Viewer"  — sees full map + all enemies. Clicks to Ping.
- *          Drives physics, AI, timer (source of truth). Sends state
- *          to Mover every frame via DataConnection.
+ *  HOST  = "Viewer"  — full map view, clicks to Ping. Drives physics.
+ *  MOVER = "Player"  — fog-of-war, WASD / Arrow / D-Pad.
+ *  VOICE — PeerJS MediaConnection, auto-established on connect.
  *
- *  MOVER = "Player" — sees Fog-of-War. WASD / Arrow / D-Pad.
- *          Sends input to Host. Receives rendered state.
+ *  ── GHOST AI OVERHAUL (Pac-Man Continuous Flow) ─────────────────
  *
- *  VOICE — PeerJS MediaConnection auto-established on connect.
+ *  1. TARGET TILE SYSTEM  (always moving)
+ *     • Each ghost is ALWAYS in state MOVING_TO_TARGET.
+ *     • On arrival, a new target is picked IMMEDIATELY.
+ *     • New targets must be ≥ TARGET_MIN_DIST (10) BFS tiles away —
+ *       forcing full-maze traversal like Pac-Man ghosts.
+ *     • pickLongDistanceTarget() floods from the ghost's current tile,
+ *       collects all cells with BFS dist ≥ 10, and picks randomly.
+ *       Falls back to ≥5 then any cell if the maze is small.
  *
- *  ── CHANGES IN THIS VERSION ─────────────────────────────────────
+ *  2. BOREDOM TIMER  (2-second anti-camping)
+ *     • If a ghost is within EXIT_GUARD_TILES (3) of the exit tile
+ *       OR on any shortest-path tile, and is NOT chasing, a 2-second
+ *       "boredom" clock runs.
+ *     • On expiry: getOppositeQuadrantTarget() finds the ghost's
+ *       current map quadrant (TL/TR/BL/BR) and picks a random floor
+ *       cell from the diagonally opposite quadrant.
  *
- *  EXPANDED PATROL (7-tile wander radius, non-stop movement)
- *    • PATROL_WANDER_R raised from 5 → 7, forcing ghosts to roam
- *      much further and clear the exit area naturally.
- *    • On reaching any wander target the ghost immediately picks a
- *      new one that is ≥5 manhattan tiles from its current position.
- *    • ANTI-STUCK: if a ghost hasn't moved STUCK_DIST_SQ pixels in
- *      STUCK_FRAMES frames, it forces a new target ≥5 tiles away.
+ *  3. CHASE & SEARCH  ("Blinky" behaviour)
+ *     • 4-tile Euclidean sensing radius.
+ *     • On detection: aggro = true, speed = BASE × 1.4, chase player.
+ *     • On loss of sight: 3-second "search" at last-known position.
+ *       During search the ghost orbits the last-known tile in a small
+ *       circle (radius SEARCH_ORBIT_R tiles) rather than micro-jittering.
+ *     • After search expires: picks a new long-distance target.
  *
- *  "BOREDOM" TIMER — Anti-Gatekeeping
- *    • EXIT_GUARD_DIST raised to 3 tiles (TILE×3).
- *    • EXIT_CAMP_MS raised to 4 000 ms (4 seconds).
- *    • On trigger: getOppositeMapTarget() flood-fills the whole maze,
- *      sorts all floor tiles by distance-from-exit descending, picks
- *      randomly from the top 25% — guaranteed opposite side of map.
- *
- *  PATH-FAIR WANDER (50 % off-path targets)
- *    • pickWanderTarget() now receives the level's shortestPathSet.
- *    • On every target selection, a coin-flip decides whether to pull
- *      from the off-path pool (≥50 %) or the unrestricted pool.
- *    • If the off-path pool is empty, falls back to full pool.
- *
- *  PRESERVED (byte-for-byte identical to previous version)
- *    • PeerJS / STUN networking — initHost, initMover, all handlers.
- *    • Player avatar — neon cyan ball, 18px centre shadowBlur glow.
- *    • HUD, overlays, D-pad wiring, audio triggers.
- *    • Level table — +1 ghost per level from Level 0.
- *    • All draw functions — drawPlayerChar, drawGhost, drawPing, etc.
+ *  ── PRESERVED (byte-for-byte) ───────────────────────────────────
+ *     • PeerJS / STUN networking — initHost, initMover, all handlers.
+ *     • drawPlayerChar — neon cyan ball, 18 px shadowBlur glow.
+ *     • drawGhost, drawPing, drawWall, drawExit — unchanged.
+ *     • HUD, overlays, D-pad wiring, audio triggers.
+ *     • Level table — +1 ghost per level from Level 0.
+ *     • Fairness engine — BFS spawn-exclusion, path set, retries.
  * ═══════════════════════════════════════════════════════════════════
  */
 
@@ -63,29 +63,34 @@ const PLAYER_SPEED = 185;           // px/s
 
 // Ghost base
 const ENEMY_R        = TILE * 0.38;
-const ENEMY_BASE_SPD = 72;          // px/s patrol/wander speed
+const ENEMY_BASE_SPD = 72;          // px/s normal travel speed
 const ENEMY_AGGRO_M  = 1.4;         // speed multiplier while chasing
 
 // AI sensing & chase
 const SENSE_R         = TILE * 4;   // 4-tile Euclidean sensing radius
 const CHASE_LINGER_MS = 3000;       // ms to search after losing sight
 
-// Patrol / wander  ← CHANGED: radius 5 → 7
-const PATROL_WANDER_R   = 7;        // tile radius ghost roams from its home
-const WANDER_MIN_DIST   = 5;        // minimum manhattan tiles to next target
-const STUCK_FRAMES      = 20;       // frames with no movement → pick new target
-const STUCK_DIST_SQ     = 4 * 4;   // px² threshold for "haven't moved"
+// Target-tile system (Pac-Man flow)
+const TARGET_MIN_DIST   = 10;       // BFS tiles — minimum distance to next target
+const TARGET_FALLBACK_1 = 5;        // fallback if < 10 reachable
+const ARRIVAL_THRESH    = TILE * 0.45; // px — "close enough" to snap to target
 
-// Exit-camping "Boredom" timer  ← CHANGED: 2→3 tiles, 2 000→4 000 ms
-const EXIT_GUARD_DIST   = TILE * 3; // ghost is "near exit" if closer than this
-const EXIT_CAMP_MS      = 4000;     // ms before boredom relocation triggers
-// Top fraction of map (by dist-from-exit) used for opposite-side relocation
-const OPPOSITE_POOL_PCT = 0.25;
+// Search orbit (Blinky behaviour on loss of sight)
+const SEARCH_ORBIT_R    = TILE * 2; // px radius of orbit circle at last-known pos
+const SEARCH_ORBIT_SPD  = 1.8;      // rad/s orbit angular velocity
+
+// Boredom / exit-camping
+const EXIT_GUARD_TILES  = 3;        // tile radius around exit that triggers boredom
+const BOREDOM_MS        = 2000;     // ms of idle-near-exit before forced relocation
+
+// Stuck safety net
+const STUCK_FRAMES      = 24;       // frames with no movement → force new target
+const STUCK_DIST_SQ     = 3 * 3;   // px² threshold for "haven't moved"
 
 // Spawn rules
 const SPAWN_MIN_DIST    = TILE * 4; // min ghost distance from player start
 const ENEMY_SPACE_MIN   = TILE * 3; // min distance between ghosts
-const EXIT_BUFFER_TILES = 2;        // tiles before exit that are spawn-protected
+const EXIT_BUFFER_TILES = 2;        // shortest-path tiles before exit, spawn-excluded
 
 // Misc
 const FOG_R              = TILE * 3.4;
@@ -104,7 +109,7 @@ const C = {
 };
 
 // ───────────────────────────────────────────────────────────────────
-//  SEEDED RNG  (mulberry32)
+//  SEEDED RNG  (mulberry32) — unchanged
 // ───────────────────────────────────────────────────────────────────
 
 function mulberry32(seed) {
@@ -118,10 +123,9 @@ function mulberry32(seed) {
 }
 
 // ───────────────────────────────────────────────────────────────────
-//  BFS UTILITIES
+//  BFS UTILITIES — unchanged
 // ───────────────────────────────────────────────────────────────────
 
-/** True if (ec,er) is reachable from (sc,sr) through floor tiles. */
 function bfsReachable(grid, sc, sr, ec, er) {
   if (grid[sr]?.[sc] !== 0 || grid[er]?.[ec] !== 0) return false;
   const vis = Array.from({ length: ROWS }, () => new Uint8Array(COLS));
@@ -141,10 +145,6 @@ function bfsReachable(grid, sc, sr, ec, er) {
   return false;
 }
 
-/**
- * BFS shortest path [{c,r}…] from (sc,sr) to (ec,er), or null.
- * Includes both endpoints.
- */
 function bfsShortestPath(grid, sc, sr, ec, er) {
   if (grid[sr]?.[sc] !== 0 || grid[er]?.[ec] !== 0) return null;
   const vis  = Array.from({ length: ROWS }, () => new Uint8Array(COLS));
@@ -174,10 +174,6 @@ function bfsShortestPath(grid, sc, sr, ec, er) {
   return path;
 }
 
-/**
- * BFS flood from (sc,sr), optionally limited to BFS distance ≤ maxDist.
- * Returns all reachable {c,r,d} cells.
- */
 function bfsFlood(grid, sc, sr, maxDist = Infinity) {
   const result = [];
   const vis    = Array.from({ length: ROWS }, () => new Uint8Array(COLS));
@@ -199,14 +195,13 @@ function bfsFlood(grid, sc, sr, maxDist = Infinity) {
 }
 
 // ───────────────────────────────────────────────────────────────────
-//  MAZE GENERATION  (recursive backtracker + loop cuts)
+//  MAZE GENERATION — unchanged
 // ───────────────────────────────────────────────────────────────────
 
 function carveMaze(seed, extraLoops) {
   const rng  = mulberry32(seed);
   const grid = Array.from({ length: ROWS }, () => Array(COLS).fill(1));
   const vis  = Array.from({ length: ROWS }, () => Array(COLS).fill(false));
-
   function carve(cx, cy) {
     vis[cy][cx]  = true;
     grid[cy][cx] = 0;
@@ -220,7 +215,6 @@ function carveMaze(seed, extraLoops) {
     }
   }
   carve(1, 1);
-
   for (let i = 0; i < extraLoops; i++) {
     const x = Math.floor(rng() * (COLS-2)) + 1;
     const y = Math.floor(rng() * (ROWS-2)) + 1;
@@ -231,7 +225,6 @@ function carveMaze(seed, extraLoops) {
       if (floorN >= 2) grid[y][x] = 0;
     }
   }
-
   grid[1][1]           = 0;
   grid[ROWS-2][COLS-2] = 0;
   return grid;
@@ -242,7 +235,6 @@ function buildMaze(seed, extraLoops) {
     const g = carveMaze(seed + a * 7919, extraLoops);
     if (bfsReachable(g, 1, 1, COLS-2, ROWS-2)) return g;
   }
-  // Fallback: punch corridors
   const g = carveMaze(seed, extraLoops);
   for (let c = 1; c < COLS-1; c++) g[1][c] = 0;
   for (let r = 1; r < ROWS-1; r++) g[r][COLS-2] = 0;
@@ -251,7 +243,7 @@ function buildMaze(seed, extraLoops) {
 }
 
 // ───────────────────────────────────────────────────────────────────
-//  LEVEL TABLE  (10 levels, index 0–9, +1 ghost per level)
+//  LEVEL TABLE — unchanged (+1 ghost per level from Level 0)
 // ───────────────────────────────────────────────────────────────────
 
 const LEVELS = [
@@ -267,10 +259,6 @@ const LEVELS = [
   /* 9 */ { seed:2010, loops: 3, enemies:10, aggroOn:true  },
 ];
 
-// ───────────────────────────────────────────────────────────────────
-//  GAME STATE ENUM
-// ───────────────────────────────────────────────────────────────────
-
 const S = { MENU:"MENU", PLAYING:"PLAYING", PAUSED:"PAUSED",
             DANCING:"DANCING", WIN:"WIN", DEAD:"DEAD" };
 
@@ -279,7 +267,7 @@ const S = { MENU:"MENU", PLAYING:"PLAYING", PAUSED:"PAUSED",
 // ───────────────────────────────────────────────────────────────────
 
 let appState    = S.MENU;
-let role        = null;      // "host" | "mover"
+let role        = null;
 let levelIdx    = 0;
 
 let maze        = null;
@@ -291,16 +279,14 @@ let invuUntil   = 0;
 let danceTimer  = 0;
 let pingCounter = 0;
 
-// Exit world-space coordinates (constant per maze layout)
 const EXIT_C = COLS - 2;
 const EXIT_R = ROWS - 2;
 const EXIT_X = EXIT_C * TILE + TILE / 2;
 const EXIT_Y = EXIT_R * TILE + TILE / 2;
 
-// Shortest-path tile set for current level (Set of "c,r" strings)
+// Shortest-path tile set (Set of "c,r" strings) — used for boredom sensing
 let shortestPathSet = new Set();
 
-// ── Input maps ──
 const localKeys  = {};
 let   remoteKeys = {};
 
@@ -311,7 +297,7 @@ window.addEventListener("keydown", e => {
 window.addEventListener("keyup", e => { localKeys[e.code] = false; });
 
 // ───────────────────────────────────────────────────────────────────
-//  MOBILE D-PAD  (touch events injected into localKeys)
+//  MOBILE D-PAD — unchanged
 // ───────────────────────────────────────────────────────────────────
 
 function wireDpad() {
@@ -330,14 +316,14 @@ function wireDpad() {
 }
 
 function updateDpadVisibility() {
-  const dpad     = document.getElementById("dpad");
-  const isMover  = role === "mover";
-  const isTouch  = navigator.maxTouchPoints > 0 || window.innerWidth <= 768;
+  const dpad    = document.getElementById("dpad");
+  const isMover = role === "mover";
+  const isTouch = navigator.maxTouchPoints > 0 || window.innerWidth <= 768;
   dpad.classList.toggle("hidden", !(isMover && isTouch));
 }
 
 // ───────────────────────────────────────────────────────────────────
-//  AUDIO  (preserved)
+//  AUDIO — unchanged
 // ───────────────────────────────────────────────────────────────────
 
 const bgMusic  = new Audio("/bgmusic.mp3");
@@ -349,36 +335,25 @@ const sfxWin   = new Audio("/win.mp3");
 const sfxDeath = new Audio("/death.mp3");
 const sfxPing  = new Audio("/ping.mp3");
 
-function playBgm() {
-  if (bgStarted) return;
-  bgStarted = true;
-  bgMusic.play().catch(() => {});
-}
-function stopBgm() {
-  bgMusic.pause();
-  bgMusic.currentTime = 0;
-  bgStarted = false;
-}
+function playBgm() { if (bgStarted) return; bgStarted = true; bgMusic.play().catch(() => {}); }
+function stopBgm() { bgMusic.pause(); bgMusic.currentTime = 0; bgStarted = false; }
 function playSfx(audio) {
   try { const c = audio.cloneNode(); c.volume = 0.7; c.play().catch(() => {}); } catch(_) {}
 }
 
 // ───────────────────────────────────────────────────────────────────
-//  CANVAS
+//  CANVAS — unchanged
 // ───────────────────────────────────────────────────────────────────
 
 const canvas = document.getElementById("game-canvas");
 const ctx    = canvas.getContext("2d");
 
-function resizeCanvas() {
-  canvas.width  = window.innerWidth;
-  canvas.height = window.innerHeight;
-}
+function resizeCanvas() { canvas.width = window.innerWidth; canvas.height = window.innerHeight; }
 window.addEventListener("resize", resizeCanvas);
 resizeCanvas();
 
 // ───────────────────────────────────────────────────────────────────
-//  PEERJS NETWORKING  ← PRESERVED EXACTLY — zero changes
+//  PEERJS NETWORKING — PRESERVED EXACTLY, zero changes
 // ───────────────────────────────────────────────────────────────────
 
 let peer        = null;
@@ -395,7 +370,6 @@ async function getMic() {
   } catch(e) { console.warn("Mic not available:", e); return null; }
 }
 
-// ── HOST ──────────────────────────────────────────────────────────
 function initHost() {
   role = "host";
   const roomId = makeRoomId();
@@ -408,14 +382,12 @@ function initHost() {
   peer.on("connection", dc => {
     dataConn = dc;
     setStatus("host", "🎮 Player connecting…");
-
     dc.on("open", () => {
       setStatus("host", "🎮 Player connected! Starting…");
       initLevel(levelIdx);
       dc.send(buildLevelPacket());
       transitionToGame();
     });
-
     dc.on("data",  onDataFromMover);
     dc.on("error", e => console.error("DC error:", e));
   });
@@ -429,7 +401,6 @@ function initHost() {
   peer.on("error", e => { setStatus("host", `❌ PeerJS: ${e.type}`); console.error(e); });
 }
 
-// ── MOVER ─────────────────────────────────────────────────────────
 async function initMover(hostId) {
   role = "mover";
   setStatus("join", "⏳ Connecting to host…");
@@ -438,7 +409,6 @@ async function initMover(hostId) {
   peer.on("open", async () => {
     const stream = await getMic();
     dataConn = peer.connect(hostId, { reliable: true, serialization: "json" });
-
     dataConn.on("open", () => {
       setStatus("join", "✅ Connected! Waiting for level…");
       if (stream) {
@@ -446,7 +416,6 @@ async function initMover(hostId) {
         mediaConn.on("stream", attachRemoteAudio);
       }
     });
-
     dataConn.on("data",  onDataFromHost);
     dataConn.on("error", e => console.error("DC error:", e));
   });
@@ -462,8 +431,6 @@ function attachRemoteAudio(stream) {
   el("voice-badge").classList.remove("hidden");
 }
 
-// ── DATA HANDLERS ─────────────────────────────────────────────────
-
 function onDataFromMover(pkt) {
   if (!pkt) return;
   if (pkt.type === "input") remoteKeys = pkt.keys || {};
@@ -472,46 +439,28 @@ function onDataFromMover(pkt) {
 function onDataFromHost(pkt) {
   if (!pkt) return;
   switch (pkt.type) {
-
     case "levelData":
-      maze      = pkt.maze;
-      player    = pkt.player;
-      enemies   = pkt.enemies;
-      pings     = [];
-      elapsed   = 0;
-      levelIdx  = pkt.levelIdx;
+      maze = pkt.maze; player = pkt.player; enemies = pkt.enemies;
+      pings = []; elapsed = 0; levelIdx = pkt.levelIdx;
       invuUntil = performance.now() + INVU_MS;
-      updateHudLevel();
-      transitionToGame();
+      updateHudLevel(); transitionToGame();
       break;
-
     case "state":
       if (pkt.player)  player  = pkt.player;
       if (pkt.enemies) enemies = pkt.enemies;
       if (pkt.pings)   pings   = pkt.pings;
       elapsed = pkt.elapsed ?? elapsed;
       updateTimer(elapsed);
-      if (pkt.appState && pkt.appState !== appState) {
-        appState = pkt.appState;
-        syncOverlays();
-      }
+      if (pkt.appState && pkt.appState !== appState) { appState = pkt.appState; syncOverlays(); }
       break;
-
     case "event":
       handleRemoteEvent(pkt);
       break;
-
     case "loadLevel":
-      maze      = pkt.maze;
-      player    = pkt.player;
-      enemies   = pkt.enemies;
-      pings     = [];
-      elapsed   = 0;
-      levelIdx  = pkt.levelIdx;
+      maze = pkt.maze; player = pkt.player; enemies = pkt.enemies;
+      pings = []; elapsed = 0; levelIdx = pkt.levelIdx;
       invuUntil = performance.now() + INVU_MS;
-      updateHudLevel();
-      appState  = S.PLAYING;
-      syncOverlays();
+      updateHudLevel(); appState = S.PLAYING; syncOverlays();
       break;
   }
 }
@@ -521,8 +470,6 @@ function handleRemoteEvent(pkt) {
   if (pkt.evt === "death") triggerDeath(false);
   if (pkt.evt === "ping")  playSfx(sfxPing);
 }
-
-// ── BROADCAST HELPERS ─────────────────────────────────────────────
 
 let lastStateSend = 0;
 function sendState() {
@@ -534,15 +481,18 @@ function sendState() {
     type: "state",
     player,
     enemies: enemies.map(e => ({ x:e.x, y:e.y, aggro:e.aggro })),
-    pings,
-    elapsed,
-    appState,
+    pings, elapsed, appState,
   });
 }
 
 function sendEvent(evt, extra = {}) {
   dataConn?.open && dataConn.send({ type:"event", evt, ...extra });
 }
+
+// ───────────────────────────────────────────────────────────────────
+//  LEVEL PACKET — updated: patrolPath/patrolIdx/patrolDir replaced
+//  with targetTile; wanderTarget replaced with targetTile
+// ───────────────────────────────────────────────────────────────────
 
 function buildLevelPacket() {
   return {
@@ -557,31 +507,27 @@ function buildLevelPacket() {
       aggroEnabled: e.aggroEnabled,
       homeC:        e.homeC,
       homeR:        e.homeR,
-      wanderTarget: e.wanderTarget,
-      patrolPath:   e.patrolPath,
-      patrolIdx:    e.patrolIdx,
-      patrolDir:    e.patrolDir,
+      // Pac-Man target tile
+      targetTile:   e.targetTile,
+      // Chase / search
       chaseUntil:   0,
       searchUntil:  0,
+      searchAngle:  0,         // orbit angle during search
       lastKnownPx:  e.x,
       lastKnownPy:  e.y,
+      // Anti-stuck
       stuckFrames:  0,
       lastX:        e.x,
       lastY:        e.y,
-      exitCampSince: 0,
+      // Boredom
+      boredSince:   0,
     })),
   };
 }
 
 // ───────────────────────────────────────────────────────────────────
 //  LEVEL INIT  (Host-authoritative)
-//  FAIRNESS ENGINE:
-//    1. Exit must be structurally reachable.
-//    2. BFS shortest path found; exit tile + EXIT_BUFFER_TILES tiles
-//       before it are protected from spawns.
-//    3. shortestPathSet stored globally for path-fair wander picks.
-//    4. Enemy quota must be fillable without using excluded tiles.
-//    Retries up to MAX_LEVEL_ATTEMPTS with shifted seeds.
+//  Fairness engine unchanged — spawn exclusion + path set + retries.
 // ───────────────────────────────────────────────────────────────────
 
 function initLevel(idx) {
@@ -600,37 +546,27 @@ function initLevel(idx) {
     const path = bfsShortestPath(builtMaze, 1, 1, EXIT_C, EXIT_R);
     if (!path) { attempt++; continue; }
 
-    // Spawn exclusion: exit tile + EXIT_BUFFER_TILES tiles before it
     const excSet = new Set();
     const bufStart = Math.max(0, path.length - 1 - EXIT_BUFFER_TILES);
     for (let i = bufStart; i < path.length; i++) excSet.add(`${path[i].c},${path[i].r}`);
-    // Full path excluded from spawns (but NOT from movement)
     path.forEach(p => excSet.add(`${p.c},${p.r}`));
 
     const px = 1 * TILE + TILE / 2;
     const py = 1 * TILE + TILE / 2;
-
-    // Build the path set now so pickWanderTarget can use it at spawn time
-    // We pass excSet as both the spawn-exclusion set AND the path-fairness set
     builtEnemies = trySpawnEnemies(
       cfg.enemies, cfg.seed + 9999 + seedOff,
       cfg.aggroOn, builtMaze, px, py, excSet
     );
 
-    if (builtEnemies !== null) {
-      builtPathSet = excSet;
-      break;
-    }
+    if (builtEnemies !== null) { builtPathSet = excSet; break; }
     attempt++;
   }
 
-  // Last-resort fallback
   if (!builtEnemies) {
-    // Build a minimal path set for the last-built maze
     const fallbackPath = bfsShortestPath(builtMaze, 1, 1, EXIT_C, EXIT_R);
     const fallbackSet  = new Set();
     if (fallbackPath) fallbackPath.forEach(p => fallbackSet.add(`${p.c},${p.r}`));
-    shortestPathSet = fallbackSet; // set it before spawn so pickWanderTarget can use it
+    shortestPathSet = fallbackSet;
     builtEnemies = trySpawnEnemies(
       cfg.enemies, cfg.seed + 9999, cfg.aggroOn, builtMaze,
       1 * TILE + TILE/2, 1 * TILE + TILE/2, new Set()
@@ -648,8 +584,7 @@ function initLevel(idx) {
 }
 
 // ───────────────────────────────────────────────────────────────────
-//  ENEMY SPAWNING
-//  Returns filled array or null (triggers initLevel retry).
+//  ENEMY SPAWNING — updated: uses targetTile, no patrolPath
 // ───────────────────────────────────────────────────────────────────
 
 function trySpawnEnemies(count, seed, aggroEnabled, grid, px, py, excSet) {
@@ -669,7 +604,6 @@ function trySpawnEnemies(count, seed, aggroEnabled, grid, px, py, excSet) {
     }
   }
 
-  // Fisher-Yates shuffle
   for (let i = candidates.length - 1; i > 0; i--) {
     const j = Math.floor(rng() * (i + 1));
     [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
@@ -679,9 +613,8 @@ function trySpawnEnemies(count, seed, aggroEnabled, grid, px, py, excSet) {
     if (list.length >= count) break;
     if (list.some(e => Math.hypot(cand.ex - e.x, cand.ey - e.y) < ENEMY_SPACE_MIN)) continue;
 
-    const patrolPath = buildLocalPatrol(cand.c, cand.r, grid, rng);
-    // Initial wander target respects path-fairness from the start
-    const initTarget = pickWanderTarget(cand.c, cand.r, grid, rng, shortestPathSet);
+    // Each ghost gets an initial long-distance target right away
+    const initTarget = pickLongDistanceTarget(cand.c, cand.r, grid, rng);
 
     list.push({
       x:            cand.ex,
@@ -692,18 +625,16 @@ function trySpawnEnemies(count, seed, aggroEnabled, grid, px, py, excSet) {
       aggroEnabled,
       homeC:        cand.c,
       homeR:        cand.r,
-      wanderTarget: initTarget,
-      patrolPath,
-      patrolIdx:    0,
-      patrolDir:    1,
+      targetTile:   initTarget,   // current destination — always set
       chaseUntil:   0,
       searchUntil:  0,
+      searchAngle:  rng() * Math.PI * 2,  // random start angle for orbit
       lastKnownPx:  cand.ex,
       lastKnownPy:  cand.ey,
       stuckFrames:  0,
       lastX:        cand.ex,
       lastY:        cand.ey,
-      exitCampSince: 0,
+      boredSince:   0,
     });
   }
 
@@ -711,112 +642,61 @@ function trySpawnEnemies(count, seed, aggroEnabled, grid, px, py, excSet) {
 }
 
 // ───────────────────────────────────────────────────────────────────
-//  WANDER TARGET PICKER  ← UPDATED: path-fairness coin-flip
-//
-//  pathSet  — Set of "c,r" strings marking the shortest-path tiles.
-//  On each call a coin-flip (rng() < 0.5) decides whether the next
-//  target is drawn from the OFF-PATH pool or the full pool.
-//  This guarantees ≥50 % of targets are away from the critical path,
-//  creating the "open windows" required by the spec.
-//  Falls back to full pool if the off-path pool is empty.
+//  LONG-DISTANCE TARGET PICKER
+//  BFS-floods the whole maze from the ghost's current tile.
+//  Picks randomly from cells with BFS distance ≥ TARGET_MIN_DIST.
+//  Falls back to ≥ TARGET_FALLBACK_1, then any other cell.
 // ───────────────────────────────────────────────────────────────────
 
-function pickWanderTarget(homeC, homeR, grid, rng, pathSet) {
-  // Use the global shortestPathSet if no override supplied
-  if (!pathSet) pathSet = shortestPathSet;
+function pickLongDistanceTarget(fromC, fromR, grid, rng) {
+  const all = bfsFlood(grid, fromC, fromR);   // full maze flood
 
-  // Flood fill within wander radius from home
-  const pool = bfsFlood(grid, homeC, homeR, PATROL_WANDER_R);
+  // Prefer ≥10 tiles away
+  let pool = all.filter(p => p.d >= TARGET_MIN_DIST);
+  if (pool.length === 0) pool = all.filter(p => p.d >= TARGET_FALLBACK_1);
+  if (pool.length === 0) pool = all.filter(p => p.d > 0);  // any non-current
+  if (pool.length === 0) return { c: fromC, r: fromR };    // degenerate fallback
 
-  if (pool.length <= 1) {
-    // Dead-end home — widen search to full map
-    const wide = bfsFlood(grid, homeC, homeR, ROWS + COLS);
-    if (wide.length > 1) {
-      const pick = wide[1 + Math.floor(rng() * (wide.length - 1))];
-      return { c: pick.c, r: pick.r };
-    }
-    return { c: homeC, r: homeR };
-  }
-
-  // Split pool: tiles NOT on the shortest path vs full pool
-  const offPath = pool.filter(p => !pathSet.has(`${p.c},${p.r}`) && p.d >= WANDER_MIN_DIST);
-  const farAll  = pool.filter(p => p.d >= WANDER_MIN_DIST);
-  // Prefer far cells; fall back to any cell if pool is thin
-  const fullPool = farAll.length > 0 ? farAll : pool;
-
-  // Coin-flip: ≥50 % chance to pick from off-path
-  const useOffPath = offPath.length > 0 && rng() < 0.6; // 60 % off-path bias
-  const src = useOffPath ? offPath : fullPool;
-  const pick = src[Math.floor(rng() * src.length)];
-  return { c: pick.c, r: pick.r };
+  return pool[Math.floor(rng() * pool.length)];
 }
 
 // ───────────────────────────────────────────────────────────────────
-//  LOCAL PATROL BUILDER  (fallback tight patrol near home)
+//  OPPOSITE-QUADRANT RELOCATION
+//  Maps the ghost's current tile to one of 4 quadrants (TL/TR/BL/BR)
+//  and picks a random floor cell from the diagonally opposite quadrant.
 // ───────────────────────────────────────────────────────────────────
 
-function buildLocalPatrol(sc, sr, grid, rng) {
-  const pool = bfsFlood(grid, sc, sr, 3);
-  pool.sort((a, b) => b.d - a.d);
+function getOppositeQuadrantTarget(eC, eR, rng) {
+  // Determine which quadrant the ghost is in
+  const midC = Math.floor(COLS / 2);
+  const midR = Math.floor(ROWS / 2);
+  const inLeft = eC < midC;
+  const inTop  = eR < midR;
 
-  const waypoints = [{ c: sc, r: sr }];
-  for (const cell of pool) {
-    if (waypoints.length >= 6) break;
-    const last = waypoints[waypoints.length - 1];
-    if (Math.abs(cell.c - last.c) + Math.abs(cell.r - last.r) >= 2) {
-      waypoints.push({ c: cell.c, r: cell.r });
+  // Opposite quadrant bounds
+  const minC = inLeft  ? midC : 0;
+  const maxC = inLeft  ? COLS : midC;
+  const minR = inTop   ? midR : 0;
+  const maxR = inTop   ? ROWS : midR;
+
+  // Collect all floor cells in the opposite quadrant
+  const pool = [];
+  for (let r = minR; r < maxR; r++) {
+    for (let c = minC; c < maxC; c++) {
+      if (maze[r]?.[c] === 0) pool.push({ c, r });
     }
   }
 
-  if (waypoints.length < 2) {
-    for (let radius = 1; radius <= ROWS; radius++) {
-      let found = false;
-      for (const [dc, dr] of [[0,1],[0,-1],[1,0],[-1,0]]) {
-        const nc = sc + dc * radius, nr = sr + dr * radius;
-        if (nc>=0 && nc<COLS && nr>=0 && nr<ROWS && grid[nr][nc]===0 && !(nc===sc && nr===sr)) {
-          waypoints.push({ c: nc, r: nr });
-          found = true;
-          break;
-        }
-      }
-      if (found) break;
-    }
+  if (pool.length === 0) {
+    // Fallback: any floor cell far from current position
+    return pickLongDistanceTarget(eC, eR, maze, rng);
   }
-  return waypoints;
+
+  return pool[Math.floor(rng() * pool.length)];
 }
 
 // ───────────────────────────────────────────────────────────────────
-//  OPPOSITE-SIDE RELOCATION TARGET  ← REPLACES getFurthestFromExit
-//
-//  Flood-fills the whole maze from the exit tile, producing a
-//  Euclidean-distance-from-exit score for every floor cell.
-//  Sorts descending, takes the top OPPOSITE_POOL_PCT fraction, then
-//  picks randomly from that pool — guaranteed to land on the far side.
-// ───────────────────────────────────────────────────────────────────
-
-function getOppositeMapTarget(rng) {
-  // All floor cells with their Euclidean distance from exit
-  const cells = [];
-  for (let r = 0; r < ROWS; r++) {
-    for (let c = 0; c < COLS; c++) {
-      if (maze[r][c] !== 0) continue;
-      const dx = c - EXIT_C, dy = r - EXIT_R;
-      cells.push({ c, r, dist: Math.sqrt(dx*dx + dy*dy) });
-    }
-  }
-  if (cells.length === 0) return { c: 1, r: 1 };
-
-  // Sort furthest-first and take top quarter
-  cells.sort((a, b) => b.dist - a.dist);
-  const poolSize = Math.max(1, Math.floor(cells.length * OPPOSITE_POOL_PCT));
-  const pool = cells.slice(0, poolSize);
-
-  const pick = pool[Math.floor(rng() * pool.length)];
-  return { c: pick.c, r: pick.r };
-}
-
-// ───────────────────────────────────────────────────────────────────
-//  SCREEN TRANSITIONS
+//  SCREEN TRANSITIONS — unchanged
 // ───────────────────────────────────────────────────────────────────
 
 function transitionToGame() {
@@ -831,12 +711,10 @@ function transitionToGame() {
 
 function showScreen(id) {
   document.querySelectorAll(".screen").forEach(s => {
-    s.classList.remove("active");
-    s.classList.add("hidden");
+    s.classList.remove("active"); s.classList.add("hidden");
   });
   const t = el(id);
-  t.classList.remove("hidden");
-  t.classList.add("active");
+  t.classList.remove("hidden"); t.classList.add("active");
 }
 
 function syncOverlays() {
@@ -846,7 +724,7 @@ function syncOverlays() {
 }
 
 // ───────────────────────────────────────────────────────────────────
-//  GAME LOOP
+//  GAME LOOP — unchanged
 // ───────────────────────────────────────────────────────────────────
 
 let prevTs = performance.now();
@@ -856,10 +734,7 @@ function gameLoop(ts) {
   prevTs = ts;
 
   if (appState === S.PLAYING) {
-    if (role === "host") {
-      updatePhysics(dt);
-      sendState();
-    }
+    if (role === "host") { updatePhysics(dt); sendState(); }
     if (role === "mover" && dataConn?.open) {
       dataConn.send({ type:"input", keys:{ ...localKeys } });
     }
@@ -868,8 +743,7 @@ function gameLoop(ts) {
   if (appState === S.DANCING) {
     danceTimer += dt;
     if (danceTimer > 1.8) {
-      appState = S.WIN;
-      syncOverlays();
+      appState = S.WIN; syncOverlays();
       el("ov-win-time").textContent = `Escaped in ${fmtTime(elapsed)}`;
     }
     if (role === "host") sendState();
@@ -899,15 +773,16 @@ function updatePhysics(dt) {
   player.vx  = dx * norm * PLAYER_SPEED;
   player.vy  = dy * norm * PLAYER_SPEED;
   if (dx||dy) player.angle = Math.atan2(dy, dx);
-
   player.x = slideAxis(player.x, player.vx * dt, player.y, false, PLAYER_R);
   player.y = slideAxis(player.y, player.vy * dt, player.x, true,  PLAYER_R);
 
   // ── Enemy AI ─────────────────────────────────────────────────────
   for (const e of enemies) {
-    // Per-enemy seeded RNG — seed rotates every 500 ms for varied decisions
+    // Per-enemy RNG — seed rotates every 500 ms
     const eRng = mulberry32(e.homeC * 97 + e.homeR * 1013 + Math.floor(nowMs / 500));
     const dist = Math.hypot(player.x - e.x, player.y - e.y);
+    const eC   = Math.floor(e.x / TILE);
+    const eR   = Math.floor(e.y / TILE);
 
     // ──────────────────────────────────────────────────────────────
     //  A. AGGRO STATE MACHINE
@@ -920,58 +795,50 @@ function updatePhysics(dt) {
       e.lastKnownPx = player.x;
       e.lastKnownPy = player.y;
     } else if (e.aggro) {
-      if (nowMs < e.chaseUntil) {
-        // Still in linger window — keep chasing; lastKnownP frozen at sighting
-      } else {
-        // Linger expired → switch to SEARCH mode
+      if (nowMs >= e.chaseUntil) {
+        // Linger expired → switch to SEARCH mode (orbit last-known pos)
         e.aggro       = false;
-        e.searchUntil = nowMs + CHASE_LINGER_MS;
+        e.searchUntil = nowMs + CHASE_LINGER_MS; // 3-second search
       }
     }
 
     // ──────────────────────────────────────────────────────────────
-    //  B. "BOREDOM" EXIT-CAMPING PREVENTION  ← UPDATED thresholds
-    //     3-tile guard zone, 4-second timer, opposite-side relocation
+    //  B. BOREDOM TIMER
+    //     Fires when ghost is near exit OR on a shortest-path tile
+    //     and is NOT chasing. Timer = 2 seconds → opposite quadrant.
     // ──────────────────────────────────────────────────────────────
 
-    if (!e.aggro) {
+    if (!e.aggro && nowMs >= e.searchUntil) {
       const distToExit = Math.hypot(e.x - EXIT_X, e.y - EXIT_Y);
-      if (distToExit < EXIT_GUARD_DIST) {
-        if (e.exitCampSince === 0) {
-          e.exitCampSince = nowMs;                          // start timer
-        } else if (nowMs - e.exitCampSince > EXIT_CAMP_MS) {
-          // BOREDOM TRIGGERED — relocate to opposite side of the map
-          e.wanderTarget  = getOppositeMapTarget(eRng);
-          e.exitCampSince = 0;
+      const nearExit   = distToExit < EXIT_GUARD_TILES * TILE;
+      const onPath     = shortestPathSet.has(`${eC},${eR}`);
+
+      if (nearExit || onPath) {
+        if (e.boredSince === 0) {
+          e.boredSince = nowMs;                        // start boredom clock
+        } else if (nowMs - e.boredSince >= BOREDOM_MS) {
+          // BOREDOM TRIGGERED — jump to opposite quadrant
+          e.targetTile  = getOppositeQuadrantTarget(eC, eR, eRng);
+          e.boredSince  = 0;
         }
       } else {
-        e.exitCampSince = 0;                                // reset timer
+        e.boredSince = 0;                              // reset when clear
       }
     } else {
-      e.exitCampSince = 0;
+      e.boredSince = 0;
     }
 
     // ──────────────────────────────────────────────────────────────
-    //  C. ANTI-STUCK SYSTEM
-    //     ≥5 manhattan tiles enforced via stronger flood radius
+    //  C. ANTI-STUCK SAFETY NET
+    //     If the ghost hasn't moved in STUCK_FRAMES frames, force a
+    //     new long-distance target from the current position.
     // ──────────────────────────────────────────────────────────────
 
     const movedSq = (e.x - e.lastX) ** 2 + (e.y - e.lastY) ** 2;
     if (movedSq < STUCK_DIST_SQ) {
       e.stuckFrames++;
       if (e.stuckFrames >= STUCK_FRAMES && !e.aggro) {
-        // Force a new target ≥ WANDER_MIN_DIST manhattan tiles away
-        const eCol = Math.floor(e.x / TILE);
-        const eRow = Math.floor(e.y / TILE);
-        const candidates = bfsFlood(maze, e.homeC, e.homeR, PATROL_WANDER_R + 3)
-          .filter(p => Math.abs(p.c - eCol) + Math.abs(p.r - eRow) >= WANDER_MIN_DIST);
-        if (candidates.length > 0) {
-          const pick = candidates[Math.floor(eRng() * candidates.length)];
-          e.wanderTarget = { c: pick.c, r: pick.r };
-        } else {
-          // Absolute fallback: opposite side of map
-          e.wanderTarget = getOppositeMapTarget(eRng);
-        }
+        e.targetTile  = pickLongDistanceTarget(eC, eR, maze, eRng);
         e.stuckFrames = 0;
       }
     } else {
@@ -987,49 +854,61 @@ function updatePhysics(dt) {
     const spd = ENEMY_BASE_SPD * lvlSpeedMult * (e.aggro ? ENEMY_AGGRO_M : 1.0);
 
     if (e.aggro) {
-      // CHASE — steer directly toward player
+      // ── CHASE: steer directly toward player ──
       const d = dist || 1;
       e.vx = ((player.x - e.x) / d) * spd;
       e.vy = ((player.y - e.y) / d) * spd;
 
     } else if (nowMs < e.searchUntil) {
-      // SEARCH — navigate to last-known player position, then micro-twitch
+      // ── SEARCH (Blinky): orbit last-known position ──
+      // Phase 1: travel to the last-known position
       const sdx = e.lastKnownPx - e.x;
       const sdy = e.lastKnownPy - e.y;
       const sd  = Math.hypot(sdx, sdy);
-      if (sd > TILE * 0.5) {
+
+      if (sd > SEARCH_ORBIT_R * 1.5) {
+        // Still en route to last-known tile
         e.vx = (sdx / sd) * spd;
         e.vy = (sdy / sd) * spd;
       } else {
-        if (eRng() < 0.02) {
-          const micro = bfsFlood(maze, Math.floor(e.x/TILE), Math.floor(e.y/TILE), 1);
-          if (micro.length > 1) {
-            const pick = micro[1 + Math.floor(eRng() * (micro.length - 1))];
-            e.vx = ((pick.c * TILE + TILE/2 - e.x) / TILE) * spd * 0.5;
-            e.vy = ((pick.r * TILE + TILE/2 - e.y) / TILE) * spd * 0.5;
-          } else { e.vx *= 0.8; e.vy *= 0.8; }
-        } else { e.vx *= 0.85; e.vy *= 0.85; }
+        // At last-known tile — orbit it
+        e.searchAngle += SEARCH_ORBIT_SPD * dt;
+        const tx = e.lastKnownPx + Math.cos(e.searchAngle) * SEARCH_ORBIT_R;
+        const ty = e.lastKnownPy + Math.sin(e.searchAngle) * SEARCH_ORBIT_R;
+        const od = Math.hypot(tx - e.x, ty - e.y);
+        if (od > 2) {
+          e.vx = ((tx - e.x) / od) * spd * 0.7;
+          e.vy = ((ty - e.y) / od) * spd * 0.7;
+        } else {
+          e.vx = 0; e.vy = 0;
+        }
+      }
+
+      // When search expires, immediately assign a new long-distance target
+      if (nowMs >= e.searchUntil) {
+        e.targetTile = pickLongDistanceTarget(eC, eR, maze, eRng);
       }
 
     } else {
-      // WANDER PATROL — move toward wanderTarget; pick new one on arrival
-      if (e.wanderTarget) {
-        const tx = e.wanderTarget.c * TILE + TILE / 2;
-        const ty = e.wanderTarget.r * TILE + TILE / 2;
-        const pd = Math.hypot(tx - e.x, ty - e.y);
+      // ── MOVING_TO_TARGET (Pac-Man continuous flow) ──
+      // Ghost is always en route to targetTile. On arrival, pick next immediately.
+      if (!e.targetTile) {
+        e.targetTile = pickLongDistanceTarget(eC, eR, maze, eRng);
+      }
 
-        if (pd < TILE * 0.4) {
-          // Arrived — immediately pick a new target ≥ WANDER_MIN_DIST away
-          e.x = tx; e.y = ty; e.vx = 0; e.vy = 0;
-          e.wanderTarget = pickWanderTarget(e.homeC, e.homeR, maze, eRng, shortestPathSet);
-        } else {
-          e.vx = ((tx - e.x) / pd) * spd;
-          e.vy = ((ty - e.y) / pd) * spd;
-        }
+      const tx = e.targetTile.c * TILE + TILE / 2;
+      const ty = e.targetTile.r * TILE + TILE / 2;
+      const pd = Math.hypot(tx - e.x, ty - e.y);
+
+      if (pd < ARRIVAL_THRESH) {
+        // Arrived — snap and pick a NEW target ≥ 10 tiles away immediately
+        e.x = tx; e.y = ty; e.vx = 0; e.vy = 0;
+        e.targetTile = pickLongDistanceTarget(
+          e.targetTile.c, e.targetTile.r, maze, eRng
+        );
       } else {
-        // Null guard — assign immediately
-        e.wanderTarget = pickWanderTarget(e.homeC, e.homeR, maze, eRng, shortestPathSet);
-        e.vx = 0; e.vy = 0;
+        e.vx = ((tx - e.x) / pd) * spd;
+        e.vy = ((ty - e.y) / pd) * spd;
       }
     }
 
@@ -1043,18 +922,16 @@ function updatePhysics(dt) {
   // Expire pings
   pings = pings.filter(p => elapsed - p.born < 2.2);
 
-  // ── Win check ──
+  // Win check
   if (Math.hypot(player.x - EXIT_X, player.y - EXIT_Y) < TILE * 0.6) {
-    triggerWin(true);
-    return;
+    triggerWin(true); return;
   }
 
-  // ── Death check ──
+  // Death check
   if (nowMs > invuUntil) {
     for (const e of enemies) {
       if (Math.hypot(player.x - e.x, player.y - e.y) < PLAYER_R + ENEMY_R) {
-        triggerDeath(true);
-        return;
+        triggerDeath(true); return;
       }
     }
   }
@@ -1062,25 +939,17 @@ function updatePhysics(dt) {
 
 function boolAxis(keys, a, b) { return (keys[a] || keys[b]) ? 1 : 0; }
 
-/**
- * Axis-aligned sliding collision.
- * radius passed explicitly so it serves player and enemies equally.
- */
 function slideAxis(pos, vel, crossPos, isY, radius) {
   if (vel === 0) return pos;
   const next  = pos + vel;
   const half  = radius * 0.86;
   const cross = crossPos;
-
   const checks = isY
     ? [[cross-half+1, next-half], [cross+half-1, next-half],
        [cross-half+1, next+half], [cross+half-1, next+half]]
     : [[next-half, cross-half+1], [next-half, cross+half-1],
        [next+half, cross-half+1], [next+half, cross+half-1]];
-
-  for (const [wx, wy] of checks) {
-    if (solidAt(wx, wy)) return pos;
-  }
+  for (const [wx, wy] of checks) { if (solidAt(wx, wy)) return pos; }
   return next;
 }
 
@@ -1091,66 +960,45 @@ function solidAt(wx, wy) {
 }
 
 // ───────────────────────────────────────────────────────────────────
-//  WIN / DEATH / PAUSE
+//  WIN / DEATH / PAUSE — unchanged
 // ───────────────────────────────────────────────────────────────────
 
 function triggerWin(isAuthority) {
   if (appState === S.WIN || appState === S.DANCING) return;
-  playSfx(sfxWin);
-  danceTimer = 0;
-  appState   = S.DANCING;
+  playSfx(sfxWin); danceTimer = 0; appState = S.DANCING;
   if (isAuthority) sendEvent("win");
 }
 
 function triggerDeath(isAuthority) {
   if (appState === S.DEAD) return;
-  playSfx(sfxDeath);
-  appState = S.DEAD;
-  syncOverlays();
+  playSfx(sfxDeath); appState = S.DEAD; syncOverlays();
   if (isAuthority) sendEvent("death");
 }
 
 function onEsc() {
-  if (appState === S.PLAYING) {
-    appState = S.PAUSED; syncOverlays();
-  } else if (appState === S.PAUSED) {
-    appState = S.PLAYING; prevTs = performance.now(); syncOverlays();
-  }
+  if (appState === S.PLAYING)      { appState = S.PAUSED;  syncOverlays(); }
+  else if (appState === S.PAUSED)  { appState = S.PLAYING; prevTs = performance.now(); syncOverlays(); }
 }
 
 // ───────────────────────────────────────────────────────────────────
-//  NEXT LEVEL / RETRY
+//  NEXT LEVEL / RETRY — unchanged
 // ───────────────────────────────────────────────────────────────────
 
 el("btn-next-level").addEventListener("click", () => {
   if (role !== "host") return;
   levelIdx = Math.min(levelIdx + 1, LEVELS.length - 1);
-  initLevel(levelIdx);
-  updateHudLevel();
-  appState = S.PLAYING;
-  syncOverlays();
-  if (dataConn?.open) {
-    const pkt = buildLevelPacket();
-    pkt.type  = "loadLevel";
-    dataConn.send(pkt);
-  }
+  initLevel(levelIdx); updateHudLevel(); appState = S.PLAYING; syncOverlays();
+  if (dataConn?.open) { const p = buildLevelPacket(); p.type = "loadLevel"; dataConn.send(p); }
 });
 
 el("btn-retry").addEventListener("click", () => {
   if (role !== "host") return;
-  initLevel(levelIdx);
-  updateHudLevel();
-  appState = S.PLAYING;
-  syncOverlays();
-  if (dataConn?.open) {
-    const pkt = buildLevelPacket();
-    pkt.type  = "loadLevel";
-    dataConn.send(pkt);
-  }
+  initLevel(levelIdx); updateHudLevel(); appState = S.PLAYING; syncOverlays();
+  if (dataConn?.open) { const p = buildLevelPacket(); p.type = "loadLevel"; dataConn.send(p); }
 });
 
 // ───────────────────────────────────────────────────────────────────
-//  HOST CLICK → PING
+//  HOST CLICK → PING — unchanged
 // ───────────────────────────────────────────────────────────────────
 
 canvas.addEventListener("click", e => {
@@ -1161,8 +1009,7 @@ canvas.addEventListener("click", e => {
   const my = (e.clientY - rect.top  - oy) / scale;
   if (mx < 0 || my < 0 || mx > W || my > H) return;
   pings.push({ x:mx, y:my, born:elapsed, id: pingCounter++ });
-  playSfx(sfxPing);
-  sendEvent("ping");
+  playSfx(sfxPing); sendEvent("ping");
 });
 
 function hostViewTransform() {
@@ -1173,21 +1020,17 @@ function hostViewTransform() {
 }
 
 // ───────────────────────────────────────────────────────────────────
-//  RENDERER
+//  RENDERER — unchanged
 // ───────────────────────────────────────────────────────────────────
 
 function draw() {
   if (!maze || !player) return;
   const cw = canvas.width, ch = canvas.height;
   ctx.clearRect(0, 0, cw, ch);
-
   if (role === "host") {
     const { ox, oy, scale } = hostViewTransform();
-    ctx.save();
-    ctx.translate(ox, oy);
-    ctx.scale(scale, scale);
-    drawWorld();
-    ctx.restore();
+    ctx.save(); ctx.translate(ox, oy); ctx.scale(scale, scale);
+    drawWorld(); ctx.restore();
   } else {
     drawMoverView(cw, ch);
   }
@@ -1196,14 +1039,12 @@ function draw() {
 function drawWorld() {
   ctx.fillStyle = C.bg;
   ctx.fillRect(0, 0, W, H);
-
   for (let r = 0; r < ROWS; r++) {
     for (let c = 0; c < COLS; c++) {
       if (maze[r][c] === 1) drawWall(c * TILE, r * TILE);
       else { ctx.fillStyle = C.floor; ctx.fillRect(c * TILE, r * TILE, TILE, TILE); }
     }
   }
-
   drawExit();
   for (const p of pings)   drawPing(p);
   for (const e of enemies) drawGhost(e);
@@ -1213,11 +1054,8 @@ function drawWorld() {
 function drawMoverView(cw, ch) {
   const px = player.x, py = player.y;
   const ox = cw / 2 - px, oy = ch / 2 - py;
-
-  ctx.save();
-  ctx.translate(ox, oy);
+  ctx.save(); ctx.translate(ox, oy);
   drawWorld();
-
   ctx.globalCompositeOperation = "destination-in";
   const fog = ctx.createRadialGradient(px, py, FOG_R * 0.15, px, py, FOG_R);
   fog.addColorStop(0,    "rgba(0,0,0,1)");
@@ -1225,18 +1063,16 @@ function drawMoverView(cw, ch) {
   fog.addColorStop(1,    "rgba(0,0,0,0)");
   ctx.fillStyle = fog;
   ctx.fillRect(-ox, -oy, cw, ch);
-
   ctx.globalCompositeOperation = "source-over";
   const outer = ctx.createRadialGradient(px, py, FOG_R * 0.8, px, py, FOG_R * 2.2);
   outer.addColorStop(0, "rgba(3,3,14,0)");
   outer.addColorStop(1, "rgba(3,3,14,1)");
   ctx.fillStyle = outer;
   ctx.fillRect(-ox, -oy, cw, ch);
-
   ctx.restore();
 }
 
-// ── DRAW HELPERS ─────────────────────────────────────────────────
+// ── DRAW HELPERS — unchanged ─────────────────────────────────────
 
 function drawWall(x, y) {
   ctx.fillStyle = C.wall;
@@ -1273,18 +1109,15 @@ function drawExit() {
 function drawPlayerChar(px, py, angle, dancing) {
   const t = elapsed;
   const r = PLAYER_R;
-
   ctx.save();
   ctx.translate(px, py);
-
   if (dancing) {
     ctx.rotate(danceTimer * 5);
     ctx.scale(1 + 0.22 * Math.sin(danceTimer * 14),
               1 + 0.22 * Math.sin(danceTimer * 14));
   }
-
   ctx.shadowColor = C.player;
-  ctx.shadowBlur  = 18 + 6 * Math.sin(t * 4);  // 12–24 px, centre 18 px
+  ctx.shadowBlur  = 18 + 6 * Math.sin(t * 4);
 
   const bodyGrad = ctx.createRadialGradient(-r*0.2, -r*0.2, r*0.05, 0, 0, r);
   bodyGrad.addColorStop(0,   "#aaffff");
@@ -1295,8 +1128,7 @@ function drawPlayerChar(px, py, angle, dancing) {
   ctx.fillStyle = bodyGrad;
   ctx.fill();
 
-  ctx.fillStyle  = "#fff";
-  ctx.shadowBlur = 0;
+  ctx.fillStyle = "#fff"; ctx.shadowBlur = 0;
   ctx.beginPath();
   ctx.arc(-r*0.28, -r*0.22, r*0.18, 0, Math.PI*2);
   ctx.arc( r*0.28, -r*0.22, r*0.18, 0, Math.PI*2);
@@ -1325,11 +1157,10 @@ function drawPlayerChar(px, py, angle, dancing) {
       ctx.fill();
     }
   }
-
   ctx.restore();
 }
 
-// ── GHOST ─────────────────────────────────────────────────────────
+// ── GHOST — unchanged visuals, preserves searching state ─────────
 function drawGhost(e) {
   const t  = elapsed;
   const gx = e.x, gy = e.y;
@@ -1358,8 +1189,7 @@ function drawGhost(e) {
   ctx.closePath();
   ctx.fill();
 
-  ctx.fillStyle  = "#fff";
-  ctx.shadowBlur = 0;
+  ctx.fillStyle = "#fff"; ctx.shadowBlur = 0;
   ctx.beginPath();
   ctx.arc(gx - w*0.19, gy - h*0.14, w*0.115, 0, Math.PI*2);
   ctx.arc(gx + w*0.19, gy - h*0.14, w*0.115, 0, Math.PI*2);
@@ -1375,11 +1205,10 @@ function drawGhost(e) {
   ctx.restore();
 }
 
-// ── PING (ripple marker) ──────────────────────────────────────────
+// ── PING — unchanged ──────────────────────────────────────────────
 function drawPing({ x, y, born }) {
   const progress = (elapsed - born) / 2.2;
   if (progress >= 1) return;
-
   ctx.save();
   for (let ring = 0; ring < 3; ring++) {
     const rp    = (progress + ring * 0.18) % 1;
@@ -1403,46 +1232,34 @@ function drawPing({ x, y, born }) {
 }
 
 // ───────────────────────────────────────────────────────────────────
-//  HUD HELPERS
+//  HUD HELPERS — unchanged
 // ───────────────────────────────────────────────────────────────────
 
 function updateTimer(s) { el("hud-timer").textContent = fmtTime(s); }
-
 function fmtTime(s) {
-  const m   = Math.floor(s / 60).toString().padStart(2, "0");
-  const sec = Math.floor(s % 60).toString().padStart(2, "0");
+  const m = Math.floor(s/60).toString().padStart(2,"0");
+  const sec = Math.floor(s%60).toString().padStart(2,"0");
   return `${m}:${sec}`;
 }
-
 function updateHudLevel() { el("hud-level").textContent = levelIdx + 1; }
 
 // ───────────────────────────────────────────────────────────────────
-//  MENU WIRING
+//  MENU WIRING — unchanged
 // ───────────────────────────────────────────────────────────────────
 
 el("btn-host").addEventListener("click", () => {
-  playBgm();
-  setHidden("host-panel", false);
-  setHidden("join-panel",  true);
-  initHost();
+  playBgm(); setHidden("host-panel", false); setHidden("join-panel", true); initHost();
 });
-
 el("btn-join").addEventListener("click", () => {
-  playBgm();
-  setHidden("join-panel",  false);
-  setHidden("host-panel",  true);
+  playBgm(); setHidden("join-panel", false); setHidden("host-panel", true);
 });
-
 el("btn-connect").addEventListener("click", () => {
   const id = el("room-code-input").value.trim().toUpperCase();
-  if (!id) return;
-  initMover(id);
+  if (!id) return; initMover(id);
 });
-
 el("room-code-input").addEventListener("keydown", e => {
   if (e.key === "Enter") el("btn-connect").click();
 });
-
 el("btn-copy-code").addEventListener("click", () => {
   const code = el("room-code-display").textContent;
   navigator.clipboard.writeText(code).then(() => {
@@ -1452,7 +1269,7 @@ el("btn-copy-code").addEventListener("click", () => {
 });
 
 // ───────────────────────────────────────────────────────────────────
-//  UTILITY
+//  UTILITY — unchanged
 // ───────────────────────────────────────────────────────────────────
 
 function el(id)              { return document.getElementById(id); }
