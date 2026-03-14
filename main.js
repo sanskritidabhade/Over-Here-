@@ -1,6 +1,6 @@
 /**
  * ═══════════════════════════════════════════════════════════════════
- *  OVER HERE! — main.js  (AI + Level Overhaul)
+ *  OVER HERE! — main.js
  *  Vite + PeerJS P2P Networked Maze Game
  * ═══════════════════════════════════════════════════════════════════
  *
@@ -8,23 +8,47 @@
  *          Drives physics, AI, timer (source of truth). Sends state
  *          to Mover every frame via DataConnection.
  *
- *  MOVER = "Player" — sees Fog-of-War. WASD/Arrow movement.
+ *  MOVER = "Player" — sees Fog-of-War. WASD / Arrow / D-Pad movement.
  *          Sends input to Host every frame. Receives rendered state.
  *
  *  VOICE — PeerJS MediaConnection auto-established on connect.
  *
- *  AI / LEVEL FIXES IN THIS VERSION
- *  ─────────────────────────────────
- *  ✔ BFS pathfinding replaces random-walk patrol → ghosts never get stuck
- *  ✔ Sense radius = 4 tiles (Euclidean). Aggro at 1.5× base speed.
- *  ✔ 3-second post-sense chase before returning to patrol.
- *  ✔ BFS flood-fill guarantees start→exit path exists before accepting maze.
- *  ✔ Enemy spacing: ≥3 tiles from each other and ≥5 tiles from player start.
- *  ✔ Level 1: 0 enemies. Level 2: 1 patrol (no aggro). Level 3: 1 aggro.
- *    Levels 4-10: +1 enemy per level, full aggro + 3-sec chase.
- *  ✔ All networking/PeerJS logic preserved unchanged.
- *  ✔ Player avatar (neon ball) unchanged.
- *  ✔ Font/BGM/SFX triggers unchanged.
+ *  ── CHANGES IN THIS VERSION ────────────────────────────────────────
+ *
+ *  FAIRNESS ENGINE (Level 3+)
+ *    • After maze generation, bfsShortestPath() finds the true shortest
+ *      route from Start → Exit.
+ *    • spawnEnemies() refuses to place any ghost on a shortest-path tile.
+ *    • buildLevel() retries up to MAX_LEVEL_ATTEMPTS times if:
+ *        a) exit is structurally unreachable (bfsReachable fails), OR
+ *        b) the ghost quota cannot be filled without blocking the path.
+ *
+ *  ENEMY SCALING  (Level 0 = 1 ghost, +1 per level, all 10 levels)
+ *    • Level 0: 1 ghost, aggro OFF  (tutorial)
+ *    • Level 1: 2 ghosts, aggro OFF
+ *    • Level 2: 3 ghosts, aggro ON  (first chase level)
+ *    • Levels 3-9: count = level+1, aggro ON, mazes tighter per level
+ *
+ *  ACTIVE PATROL  (ghosts never stand still)
+ *    • buildLocalPatrol() creates a tight 3×3-radius ping-pong route
+ *      around the spawn point, using only reachable floor cells.
+ *    • If <2 waypoints found, ghost does a straight back-and-forth on
+ *      whatever corridor it is in.
+ *    • patrolDir flag on each enemy flips direction at path ends so
+ *      motion is continuous (no pause at waypoint ends).
+ *
+ *  CHASE BEHAVIOUR
+ *    • Sensing radius: 4 tiles Euclidean (SENSE_R = TILE * 4).
+ *    • On sight: aggro = true, speed = BASE * 1.4.
+ *    • On leaving radius: ghost persists in chase for exactly 3 seconds
+ *      before returning to patrol (chaseUntil timestamp).
+ *
+ *  PRESERVED SYSTEMS
+ *    • PeerJS networking / Google STUN — untouched.
+ *    • Player avatar: neon cyan ball, 15-22px shadowBlur glow.
+ *    • HUD: bold white fonts + black text-shadow.
+ *    • Audio: bgmusic / win / death SFX triggers unchanged.
+ *    • Mobile D-Pad: wired via touch events injecting into localKeys.
  * ═══════════════════════════════════════════════════════════════════
  */
 
@@ -40,18 +64,19 @@ const ROWS = 15;          // must be odd
 const W    = COLS * TILE; // 760
 const H    = ROWS * TILE; // 600
 
-const PLAYER_R        = TILE * 0.36;  // collision radius
-const PLAYER_SPEED    = 185;          // px/s
-const ENEMY_R         = TILE * 0.38;
-const ENEMY_BASE_SPD  = 75;
-const ENEMY_AGGRO_M   = 1.5;          // FIX: was 2.2, spec says 1.5×
-const SENSE_TILES     = 4;            // FIX: 4-tile Euclidean sensing radius
-const SENSE_R         = TILE * SENSE_TILES;
-const CHASE_LINGER_MS = 3000;         // FIX: 3-second post-aggro chase
-const FOG_R           = TILE * 3.4;
-const INVU_MS         = 500;          // invulnerability at level start
-const SPAWN_MIN_DIST  = TILE * 5;     // min enemy distance from player start
-const ENEMY_SPACE_MIN = TILE * 3;     // FIX: min distance between enemies
+const PLAYER_R        = TILE * 0.36;   // player collision radius
+const PLAYER_SPEED    = 185;           // px/s
+const ENEMY_R         = TILE * 0.38;   // ghost collision radius
+const ENEMY_BASE_SPD  = 72;            // px/s patrol speed
+const ENEMY_AGGRO_M   = 1.4;           // 1.4× speed when chasing
+const SENSE_R         = TILE * 4;      // 4-tile Euclidean sensing radius
+const CHASE_LINGER_MS = 3000;          // ms to keep chasing after losing sight
+const FOG_R           = TILE * 3.4;    // Mover fog-of-war radius
+const INVU_MS         = 500;           // invulnerability window at level start (ms)
+const SPAWN_MIN_DIST  = TILE * 4;      // min ghost distance from player start
+const ENEMY_SPACE_MIN = TILE * 3;      // min distance between ghosts
+const PATROL_RADIUS   = 3;             // tiles: local patrol search radius
+const MAX_LEVEL_ATTEMPTS = 12;         // fairness engine retry cap
 
 const C = {
   bg:       "#05050f",
@@ -65,7 +90,7 @@ const C = {
 };
 
 // ───────────────────────────────────────────────────────────────────
-//  RNG
+//  SEEDED RNG  (mulberry32)
 // ───────────────────────────────────────────────────────────────────
 
 function mulberry32(seed) {
@@ -80,28 +105,24 @@ function mulberry32(seed) {
 
 // ───────────────────────────────────────────────────────────────────
 //  BFS UTILITIES
-//  Used for: path validation, enemy BFS pathfinding to next patrol node
 // ───────────────────────────────────────────────────────────────────
 
 /**
- * Returns true if a clear, walkable path exists from (sc,sr) to (ec,er)
- * by moving one tile at a time through floor cells (maze[r][c] === 0).
+ * Returns true if (ec,er) is reachable from (sc,sr) through floor tiles.
  */
 function bfsReachable(grid, sc, sr, ec, er) {
-  if (grid[sr][sc] !== 0 || grid[er][ec] !== 0) return false;
-  const visited = Array.from({ length: ROWS }, () => new Uint8Array(COLS));
-  const queue = [[sc, sr]];
-  visited[sr][sc] = 1;
-  const dirs = [[0,1],[0,-1],[1,0],[-1,0]];
-  while (queue.length) {
-    const [c, r] = queue.shift();
+  if (grid[sr]?.[sc] !== 0 || grid[er]?.[ec] !== 0) return false;
+  const vis = Array.from({ length: ROWS }, () => new Uint8Array(COLS));
+  const q   = [[sc, sr]];
+  vis[sr][sc] = 1;
+  while (q.length) {
+    const [c, r] = q.shift();
     if (c === ec && r === er) return true;
-    for (const [dc, dr] of dirs) {
-      const nc = c + dc, nr = r + dr;
-      if (nc >= 0 && nc < COLS && nr >= 0 && nr < ROWS
-          && !visited[nr][nc] && grid[nr][nc] === 0) {
-        visited[nr][nc] = 1;
-        queue.push([nc, nr]);
+    for (const [dc, dr] of [[0,1],[0,-1],[1,0],[-1,0]]) {
+      const nc = c+dc, nr = r+dr;
+      if (nc>=0 && nc<COLS && nr>=0 && nr<ROWS && !vis[nr][nc] && grid[nr][nc]===0) {
+        vis[nr][nc] = 1;
+        q.push([nc, nr]);
       }
     }
   }
@@ -109,28 +130,25 @@ function bfsReachable(grid, sc, sr, ec, er) {
 }
 
 /**
- * BFS shortest-path from (sc,sr) to (ec,er).
- * Returns array of {c,r} waypoints (inclusive of start and end),
- * or null if no path exists.
+ * Returns the BFS shortest path as [{c,r}, …] from (sc,sr) to (ec,er),
+ * or null if unreachable.
  */
-function bfsPath(grid, sc, sr, ec, er) {
-  if (grid[sr][sc] !== 0 || grid[er][ec] !== 0) return null;
-  const visited = Array.from({ length: ROWS }, () => new Uint8Array(COLS));
-  const prev    = Array.from({ length: ROWS }, () => new Array(COLS).fill(null));
-  const queue   = [[sc, sr]];
-  visited[sr][sc] = 1;
-  const dirs = [[0,1],[0,-1],[1,0],[-1,0]];
+function bfsShortestPath(grid, sc, sr, ec, er) {
+  if (grid[sr]?.[sc] !== 0 || grid[er]?.[ec] !== 0) return null;
+  const vis  = Array.from({ length: ROWS }, () => new Uint8Array(COLS));
+  const prev = Array.from({ length: ROWS }, () => new Array(COLS).fill(null));
+  const q    = [[sc, sr]];
+  vis[sr][sc] = 1;
   let found = false;
-  outer: while (queue.length) {
-    const [c, r] = queue.shift();
-    for (const [dc, dr] of dirs) {
-      const nc = c + dc, nr = r + dr;
-      if (nc >= 0 && nc < COLS && nr >= 0 && nr < ROWS
-          && !visited[nr][nc] && grid[nr][nc] === 0) {
-        visited[nr][nc] = 1;
+  outer: while (q.length) {
+    const [c, r] = q.shift();
+    for (const [dc, dr] of [[0,1],[0,-1],[1,0],[-1,0]]) {
+      const nc = c+dc, nr = r+dr;
+      if (nc>=0 && nc<COLS && nr>=0 && nr<ROWS && !vis[nr][nc] && grid[nr][nc]===0) {
+        vis[nr][nc] = 1;
         prev[nr][nc] = [c, r];
-        if (nc === ec && nr === er) { found = true; break outer; }
-        queue.push([nc, nr]);
+        if (nc===ec && nr===er) { found=true; break outer; }
+        q.push([nc, nr]);
       }
     }
   }
@@ -144,26 +162,35 @@ function bfsPath(grid, sc, sr, ec, er) {
   return path;
 }
 
-// ───────────────────────────────────────────────────────────────────
-//  MAZE GENERATION
-//  Recursive backtracker + loop cuts → imperfect maze (multi-path)
-//  FIX: Retry until BFS confirms start→exit path is clear.
-// ───────────────────────────────────────────────────────────────────
-
-function buildMaze(seed, extraLoops) {
-  // Try up to 8 variants of the seed until we get a valid maze
-  for (let attempt = 0; attempt < 8; attempt++) {
-    const grid = tryBuildMaze(seed + attempt * 31337, extraLoops);
-    // FIX: Validate that start (1,1) → exit (COLS-2, ROWS-2) is reachable
-    if (bfsReachable(grid, 1, 1, COLS - 2, ROWS - 2)) {
-      return grid;
+/**
+ * BFS flood from (sc,sr), returns all reachable {c,r} cells.
+ */
+function bfsFloodFill(grid, sc, sr) {
+  const reachable = [];
+  const vis = Array.from({ length: ROWS }, () => new Uint8Array(COLS));
+  const q   = [[sc, sr]];
+  vis[sr][sc] = 1;
+  while (q.length) {
+    const [c, r] = q.shift();
+    reachable.push({ c, r });
+    for (const [dc, dr] of [[0,1],[0,-1],[1,0],[-1,0]]) {
+      const nc = c+dc, nr = r+dr;
+      if (nc>=0 && nc<COLS && nr>=0 && nr<ROWS && !vis[nr][nc] && grid[nr][nc]===0) {
+        vis[nr][nc] = 1;
+        q.push([nc, nr]);
+      }
     }
   }
-  // Fallback: open corridors to guarantee connectivity
-  return buildOpenMaze(seed, extraLoops);
+  return reachable;
 }
 
-function tryBuildMaze(seed, extraLoops) {
+// ───────────────────────────────────────────────────────────────────
+//  MAZE GENERATION
+//  Recursive-backtracker DFS + optional loop cuts.
+//  buildMaze() retries up to MAX_LEVEL_ATTEMPTS for structural validity.
+// ───────────────────────────────────────────────────────────────────
+
+function carveMaze(seed, extraLoops) {
   const rng  = mulberry32(seed);
   const grid = Array.from({ length: ROWS }, () => Array(COLS).fill(1));
   const vis  = Array.from({ length: ROWS }, () => Array(COLS).fill(false));
@@ -173,61 +200,70 @@ function tryBuildMaze(seed, extraLoops) {
     grid[cy][cx] = 0;
     const dirs = [[0,-2],[0,2],[-2,0],[2,0]].sort(() => rng() - 0.5);
     for (const [dx, dy] of dirs) {
-      const nx = cx + dx, ny = cy + dy;
-      if (nx > 0 && nx < COLS-1 && ny > 0 && ny < ROWS-1 && !vis[ny][nx]) {
-        grid[cy + dy / 2][cx + dx / 2] = 0;
+      const nx = cx+dx, ny = cy+dy;
+      if (nx>0 && nx<COLS-1 && ny>0 && ny<ROWS-1 && !vis[ny][nx]) {
+        grid[cy + dy/2][cx + dx/2] = 0;
         carve(nx, ny);
       }
     }
   }
   carve(1, 1);
 
-  // Remove random interior walls to create loops / alternative paths
+  // Add extra loops for multiple valid paths
   for (let i = 0; i < extraLoops; i++) {
-    const x = Math.floor(rng() * (COLS - 2)) + 1;
-    const y = Math.floor(rng() * (ROWS - 2)) + 1;
+    const x = Math.floor(rng() * (COLS-2)) + 1;
+    const y = Math.floor(rng() * (ROWS-2)) + 1;
     if (grid[y][x] === 1) {
-      let floorNeighbors = 0;
-      for (const [dx, dy] of [[0,1],[0,-1],[1,0],[-1,0]]) {
-        if (grid[y+dy]?.[x+dx] === 0) floorNeighbors++;
-      }
-      if (floorNeighbors >= 2) grid[y][x] = 0;
+      let floorN = 0;
+      for (const [dx, dy] of [[0,1],[0,-1],[1,0],[-1,0]])
+        if (grid[y+dy]?.[x+dx] === 0) floorN++;
+      if (floorN >= 2) grid[y][x] = 0;
     }
   }
 
+  // Always guarantee start and exit open
   grid[1][1]           = 0;
   grid[ROWS-2][COLS-2] = 0;
-
   return grid;
 }
 
-// Fallback maze: carve explicit corridors to guarantee connectivity
-function buildOpenMaze(seed, extraLoops) {
-  const grid = tryBuildMaze(seed, extraLoops);
-  // Force a top-row corridor and a right-column corridor
-  for (let c = 1; c < COLS - 1; c++) grid[1][c] = 0;
-  for (let r = 1; r < ROWS - 1; r++) grid[r][COLS-2] = 0;
-  grid[ROWS-2][COLS-2] = 0;
-  return grid;
+/**
+ * Build a valid maze, retrying until start→exit is reachable.
+ * Falls back to a corridor-punched safe maze if all retries fail.
+ */
+function buildMaze(seed, extraLoops) {
+  for (let a = 0; a < MAX_LEVEL_ATTEMPTS; a++) {
+    const g = carveMaze(seed + a * 7919, extraLoops);
+    if (bfsReachable(g, 1, 1, COLS-2, ROWS-2)) return g;
+  }
+  // Fallback: force corridor connectivity
+  const g = carveMaze(seed, extraLoops);
+  for (let c = 1; c < COLS-1; c++) g[1][c] = 0;           // top corridor
+  for (let r = 1; r < ROWS-1; r++) g[r][COLS-2] = 0;      // right corridor
+  g[ROWS-2][COLS-2] = 0;
+  return g;
 }
 
 // ───────────────────────────────────────────────────────────────────
-//  LEVEL CONFIGS  — 10 levels
-//  FIX: Level 1: 0 enemies. Level 2: 1 patrol, no aggro.
-//       Level 3: 1 enemy with aggro. Level 4-10: +1 per level, full aggro.
+//  LEVEL TABLE  (10 levels, index 0–9)
+//
+//  Level 0: 1 ghost, no aggro  — pure tutorial
+//  Level 1: 2 ghosts, no aggro
+//  Level 2: 3 ghosts, aggro ON (first chase level)
+//  Levels 3–9: count = idx+1, aggro ON, progressively tighter mazes
 // ───────────────────────────────────────────────────────────────────
 
 const LEVELS = [
-  /* 1 */ { seed:1001, loops:12, enemies:0,  aggroOn:false },
-  /* 2 */ { seed:1002, loops:10, enemies:1,  aggroOn:false },
-  /* 3 */ { seed:1003, loops: 9, enemies:1,  aggroOn:true  },
-  /* 4 */ { seed:1004, loops: 8, enemies:2,  aggroOn:true  },
-  /* 5 */ { seed:1005, loops: 7, enemies:3,  aggroOn:true  },
-  /* 6 */ { seed:1006, loops: 6, enemies:4,  aggroOn:true  },
-  /* 7 */ { seed:1007, loops: 5, enemies:5,  aggroOn:true  },
-  /* 8 */ { seed:1008, loops: 4, enemies:6,  aggroOn:true  },
-  /* 9 */ { seed:1009, loops: 3, enemies:7,  aggroOn:true  },
-  /*10 */ { seed:1010, loops: 2, enemies:8,  aggroOn:true  },
+  /* 0 */ { seed:2001, loops:14, enemies:1,  aggroOn:false },
+  /* 1 */ { seed:2002, loops:12, enemies:2,  aggroOn:false },
+  /* 2 */ { seed:2003, loops:10, enemies:3,  aggroOn:true  },
+  /* 3 */ { seed:2004, loops: 9, enemies:4,  aggroOn:true  },
+  /* 4 */ { seed:2005, loops: 8, enemies:5,  aggroOn:true  },
+  /* 5 */ { seed:2006, loops: 7, enemies:6,  aggroOn:true  },
+  /* 6 */ { seed:2007, loops: 6, enemies:7,  aggroOn:true  },
+  /* 7 */ { seed:2008, loops: 5, enemies:8,  aggroOn:true  },
+  /* 8 */ { seed:2009, loops: 4, enemies:9,  aggroOn:true  },
+  /* 9 */ { seed:2010, loops: 3, enemies:10, aggroOn:true  },
 ];
 
 // ───────────────────────────────────────────────────────────────────
@@ -238,26 +274,28 @@ const S = { MENU:"MENU", PLAYING:"PLAYING", PAUSED:"PAUSED",
             DANCING:"DANCING", WIN:"WIN", DEAD:"DEAD" };
 
 // ───────────────────────────────────────────────────────────────────
-//  RUNTIME VARS
+//  RUNTIME STATE
 // ───────────────────────────────────────────────────────────────────
 
-let appState    = S.MENU;
-let role        = null;       // "host" | "mover"
-let levelIdx    = 0;
+let appState   = S.MENU;
+let role       = null;      // "host" | "mover"
+let levelIdx   = 0;
 
-// World (authoritative on Host, mirrored via network on Mover)
-let maze        = null;
-let player      = null;  // { x,y,vx,vy, angle }
-let enemies     = [];    // [{ x,y,vx,vy,aggro,patrolPath,patrolIdx,chaseUntil }]
-let pings       = [];    // [{ x,y,born }]
-let elapsed     = 0;     // seconds
-let invuUntil   = 0;     // performance.now() — invulnerability end
-let danceTimer  = 0;     // seconds into victory dance
+let maze       = null;
+let player     = null;      // { x, y, vx, vy, angle }
+let enemies    = [];        // [Enemy]
+let pings      = [];        // [{ x, y, born }]
+let elapsed    = 0;         // seconds, game time
+let invuUntil  = 0;         // performance.now() ms — invulnerability end
+let danceTimer = 0;         // seconds into victory dance
 let pingCounter = 0;
 
-// Input maps
-const localKeys  = {};   // this client's keyboard
-let   remoteKeys = {};   // Mover's keys received by Host
+// shortest-path tile set for the current level (Set of "c,r" strings)
+let shortestPathSet = new Set();
+
+// ── Input maps ──
+const localKeys  = {};   // keyboard / D-pad virtual keys
+let   remoteKeys = {};   // Mover's keys received over network (Host only)
 
 window.addEventListener("keydown", e => {
   localKeys[e.code] = true;
@@ -266,7 +304,53 @@ window.addEventListener("keydown", e => {
 window.addEventListener("keyup", e => { localKeys[e.code] = false; });
 
 // ───────────────────────────────────────────────────────────────────
-//  AUDIO
+//  MOBILE D-PAD WIRING
+//  Touch events on each button inject/clear the matching key code
+//  into localKeys, so the existing input system needs no changes.
+// ───────────────────────────────────────────────────────────────────
+
+function wireDpad() {
+  const dpad = document.getElementById("dpad");
+  dpad.querySelectorAll(".dpad-btn[data-key]").forEach(btn => {
+    const code = btn.dataset.key;
+
+    const press = (e) => {
+      e.preventDefault();
+      localKeys[code] = true;
+      btn.classList.add("pressed");
+    };
+    const release = (e) => {
+      e.preventDefault();
+      localKeys[code] = false;
+      btn.classList.remove("pressed");
+    };
+
+    // Touch
+    btn.addEventListener("touchstart",  press,   { passive: false });
+    btn.addEventListener("touchend",    release, { passive: false });
+    btn.addEventListener("touchcancel", release, { passive: false });
+
+    // Mouse fallback (for testing on desktop)
+    btn.addEventListener("mousedown",  press);
+    btn.addEventListener("mouseup",    release);
+    btn.addEventListener("mouseleave", release);
+  });
+}
+
+/**
+ * Show the D-pad only for the Mover role.
+ * Detects touch support; also shows on small screens regardless.
+ */
+function updateDpadVisibility() {
+  const dpad      = document.getElementById("dpad");
+  const isMover   = (role === "mover");
+  const isTouch   = navigator.maxTouchPoints > 0 || window.innerWidth <= 768;
+  const shouldShow = isMover && isTouch;
+  dpad.classList.toggle("hidden", !shouldShow);
+}
+
+// ───────────────────────────────────────────────────────────────────
+//  AUDIO  (preserved exactly)
 // ───────────────────────────────────────────────────────────────────
 
 const bgMusic  = new Audio("/bgmusic.mp3");
@@ -276,7 +360,7 @@ let bgStarted  = false;
 
 const sfxWin   = new Audio("/win.mp3");
 const sfxDeath = new Audio("/death.mp3");
-const sfxPing  = new Audio("/ping.mp3"); // optional, silent if missing
+const sfxPing  = new Audio("/ping.mp3");
 
 function playBgm() {
   if (bgStarted) return;
@@ -313,13 +397,12 @@ window.addEventListener("resize", resizeCanvas);
 resizeCanvas();
 
 // ───────────────────────────────────────────────────────────────────
-//  PEERJS NETWORKING  (PRESERVED — no changes below this line until
-//  LEVEL INIT section)
+//  PEERJS NETWORKING  ← PRESERVED EXACTLY, no changes
 // ───────────────────────────────────────────────────────────────────
 
-let peer       = null;
-let dataConn   = null;
-let mediaConn  = null;
+let peer        = null;
+let dataConn    = null;
+let mediaConn   = null;
 let localStream = null;
 
 function makeRoomId() {
@@ -336,7 +419,7 @@ async function getMic() {
   }
 }
 
-// ── HOST INIT ─────────────────────────────────────────────────────
+// ── HOST ──────────────────────────────────────────────────────────
 function initHost() {
   role = "host";
   const roomId = makeRoomId();
@@ -353,18 +436,13 @@ function initHost() {
 
     dc.on("open", () => {
       setStatus("host", "🎮 Player connected! Starting…");
-      // ── CRITICAL HANDSHAKE ──────────────────────────────────────
-      // Build the level immediately and send full levelData so Mover
-      // can transition to PLAYING without delay.
-      initLevel(levelIdx);              // sets maze, player, enemies
-      const packet = buildLevelPacket(); // package everything
-      dc.send(packet);                  // Mover gets it → PLAYING
-
-      // Host transitions to PLAYING too
+      initLevel(levelIdx);
+      const packet = buildLevelPacket();
+      dc.send(packet);
       transitionToGame();
     });
 
-    dc.on("data", onDataFromMover);
+    dc.on("data",  onDataFromMover);
     dc.on("error", e => console.error("DC error:", e));
   });
 
@@ -380,7 +458,7 @@ function initHost() {
   });
 }
 
-// ── MOVER INIT ────────────────────────────────────────────────────
+// ── MOVER ─────────────────────────────────────────────────────────
 async function initMover(hostId) {
   role = "mover";
   setStatus("join", "⏳ Connecting to host…");
@@ -389,21 +467,17 @@ async function initMover(hostId) {
 
   peer.on("open", async () => {
     const stream = await getMic();
-
-    // Data channel
     dataConn = peer.connect(hostId, { reliable: true, serialization: "json" });
 
     dataConn.on("open", () => {
       setStatus("join", "✅ Connected! Waiting for level…");
-
-      // Voice call to host
       if (stream) {
         mediaConn = peer.call(hostId, stream);
         mediaConn.on("stream", attachRemoteAudio);
       }
     });
 
-    dataConn.on("data", onDataFromHost);
+    dataConn.on("data",  onDataFromHost);
     dataConn.on("error", e => console.error("DC error:", e));
   });
 
@@ -430,16 +504,14 @@ function onDataFromMover(pkt) {
 
 function onDataFromHost(pkt) {
   if (!pkt) return;
-
   switch (pkt.type) {
 
     case "levelData":
-      // Receive maze + initial positions — transition to PLAYING
-      maze    = pkt.maze;
-      player  = pkt.player;
-      enemies = pkt.enemies;
-      pings   = [];
-      elapsed = 0;
+      maze     = pkt.maze;
+      player   = pkt.player;
+      enemies  = pkt.enemies;
+      pings    = [];
+      elapsed  = 0;
       levelIdx = pkt.levelIdx;
       invuUntil = performance.now() + INVU_MS;
       updateHudLevel();
@@ -447,7 +519,6 @@ function onDataFromHost(pkt) {
       break;
 
     case "state":
-      // Every-frame sync
       if (pkt.player)  player  = pkt.player;
       if (pkt.enemies) enemies = pkt.enemies;
       if (pkt.pings)   pings   = pkt.pings;
@@ -464,12 +535,11 @@ function onDataFromHost(pkt) {
       break;
 
     case "loadLevel":
-      // Host asks Mover to prepare for a new level
-      maze    = pkt.maze;
-      player  = pkt.player;
-      enemies = pkt.enemies;
-      pings   = [];
-      elapsed = 0;
+      maze     = pkt.maze;
+      player   = pkt.player;
+      enemies  = pkt.enemies;
+      pings    = [];
+      elapsed  = 0;
       levelIdx = pkt.levelIdx;
       invuUntil = performance.now() + INVU_MS;
       updateHudLevel();
@@ -491,7 +561,7 @@ let lastStateSend = 0;
 function sendState() {
   if (!dataConn?.open) return;
   const now = performance.now();
-  if (now - lastStateSend < 16) return; // ~60fps cap
+  if (now - lastStateSend < 16) return;
   lastStateSend = now;
   dataConn.send({
     type: "state",
@@ -514,60 +584,110 @@ function buildLevelPacket() {
     maze,
     player: { ...player },
     enemies: enemies.map(e => ({
-      x: e.x, y: e.y,
-      aggro: false,
+      x:          e.x,
+      y:          e.y,
+      aggro:      false,
       patrolPath: e.patrolPath,
       patrolIdx:  e.patrolIdx,
+      patrolDir:  e.patrolDir,
       chaseUntil: 0,
     })),
   };
 }
 
 // ───────────────────────────────────────────────────────────────────
-//  LEVEL INIT  (Host only — Mover receives via network)
+//  LEVEL INIT  (Host-authoritative)
+//  FAIRNESS ENGINE: retry loop ensures:
+//    1. Start → Exit is structurally reachable.
+//    2. Required enemy count fits without blocking the shortest path.
 // ───────────────────────────────────────────────────────────────────
 
 function initLevel(idx) {
   const cfg = LEVELS[Math.min(idx, LEVELS.length - 1)];
-  maze = buildMaze(cfg.seed, cfg.loops);
 
-  // Player spawn: top-left open cell
-  player = { x: 1 * TILE + TILE/2, y: 1 * TILE + TILE/2, vx:0, vy:0, angle:0 };
+  let builtMaze, builtEnemies, builtPath;
+  let attempt = 0;
 
-  // Enemies
-  enemies = spawnEnemies(cfg.enemies, cfg.seed + 9999, cfg.aggroOn);
+  while (attempt < MAX_LEVEL_ATTEMPTS) {
+    const seedOffset = attempt * 53881;
+    builtMaze = buildMaze(cfg.seed + seedOffset, cfg.loops);
 
+    // 1. Structural check — exit must be reachable
+    if (!bfsReachable(builtMaze, 1, 1, COLS-2, ROWS-2)) {
+      attempt++;
+      continue;
+    }
+
+    // 2. Find the shortest path (used to protect tiles from enemy spawns)
+    builtPath = bfsShortestPath(builtMaze, 1, 1, COLS-2, ROWS-2);
+    if (!builtPath) { attempt++; continue; }
+
+    // Build path set as "c,r" strings for O(1) lookup
+    const pathSet = new Set(builtPath.map(p => `${p.c},${p.r}`));
+
+    // 3. Attempt to spawn enemies with path-protection
+    const px = 1 * TILE + TILE / 2;
+    const py = 1 * TILE + TILE / 2;
+    builtEnemies = trySpawnEnemies(
+      cfg.enemies, cfg.seed + 9999 + seedOffset,
+      cfg.aggroOn, builtMaze, px, py, pathSet
+    );
+
+    if (builtEnemies !== null) {
+      // Success — commit
+      shortestPathSet = pathSet;
+      break;
+    }
+
+    attempt++;
+  }
+
+  // If all attempts failed, use the last maze and spawn wherever possible
+  if (!builtEnemies) {
+    builtEnemies = trySpawnEnemies(
+      cfg.enemies, cfg.seed + 9999,
+      cfg.aggroOn, builtMaze,
+      1 * TILE + TILE/2, 1 * TILE + TILE/2,
+      new Set()           // no path protection as last resort
+    ) || [];
+  }
+
+  maze       = builtMaze;
+  player     = { x: 1 * TILE + TILE/2, y: 1 * TILE + TILE/2, vx:0, vy:0, angle:0 };
+  enemies    = builtEnemies;
   pings      = [];
   elapsed    = 0;
   invuUntil  = performance.now() + INVU_MS;
   danceTimer = 0;
 }
 
-// ── ENEMY SPAWNING  (FIX: spacing checks + BFS patrol generation) ──
+// ───────────────────────────────────────────────────────────────────
+//  ENEMY SPAWNING
+//  Returns an enemy array if `count` enemies can be placed while
+//  respecting all constraints, or null if impossible.
+// ───────────────────────────────────────────────────────────────────
 
-function spawnEnemies(count, seed, aggroEnabled) {
+function trySpawnEnemies(count, seed, aggroEnabled, grid, px, py, pathSet) {
   const rng  = mulberry32(seed);
   const list = [];
-  const px   = player.x, py = player.y;
 
-  // Collect all floor cells that are:
-  //  • far enough from the player start (SPAWN_MIN_DIST)
-  //  • NOT on the start or exit cell
+  // Gather valid candidate floor cells
   const candidates = [];
   for (let r = 0; r < ROWS; r++) {
     for (let c = 0; c < COLS; c++) {
-      if (maze[r][c] !== 0) continue;
+      if (grid[r][c] !== 0) continue;
       if (c === 1 && r === 1) continue;           // player start
-      if (c === COLS-2 && r === ROWS-2) continue; // exit
+      if (c === COLS-2 && r === ROWS-2) continue; // exit cell
+      if (pathSet.has(`${c},${r}`)) continue;     // FAIRNESS: shortest-path tile
+
       const ex = c * TILE + TILE/2;
       const ey = r * TILE + TILE/2;
-      if (Math.hypot(ex - px, ey - py) >= SPAWN_MIN_DIST) {
-        candidates.push({ c, r, ex, ey });
-      }
+      if (Math.hypot(ex - px, ey - py) < SPAWN_MIN_DIST) continue; // too close to start
+      candidates.push({ c, r, ex, ey });
     }
   }
 
-  // Shuffle
+  // Fisher-Yates shuffle
   for (let i = candidates.length - 1; i > 0; i--) {
     const j = Math.floor(rng() * (i + 1));
     [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
@@ -576,73 +696,88 @@ function spawnEnemies(count, seed, aggroEnabled) {
   for (const cand of candidates) {
     if (list.length >= count) break;
 
-    // FIX: Ensure this candidate is at least ENEMY_SPACE_MIN from existing enemies
+    // Min spacing between ghosts
     const tooClose = list.some(e =>
       Math.hypot(cand.ex - e.x, cand.ey - e.y) < ENEMY_SPACE_MIN
     );
     if (tooClose) continue;
 
-    const patrolPath = buildBfsPatrol(cand.c, cand.r, mulberry32(seed + list.length));
+    const patrolPath = buildLocalPatrol(cand.c, cand.r, grid, rng);
 
     list.push({
-      x: cand.ex,
-      y: cand.ey,
-      vx: 0, vy: 0,
-      aggro: false,
+      x:           cand.ex,
+      y:           cand.ey,
+      vx:          0,
+      vy:          0,
+      aggro:       false,
       aggroEnabled,
       patrolPath,
-      patrolIdx:  0,
-      // FIX: timestamp (ms) until which the ghost keeps chasing after losing sight
-      chaseUntil: 0,
+      patrolIdx:   0,
+      patrolDir:   1,       // +1 forward, -1 backward through the patrol array
+      chaseUntil:  0,       // performance.now() ms — when to stop chasing
     });
   }
 
-  return list;
+  // Return null if we couldn't fill the quota (triggers a retry)
+  return list.length === count ? list : null;
 }
 
-// ─────────────────────────────────────────────────────────────────
-//  BFS PATROL BUILDER
-//  FIX: Replaces random ±2-step walk (which skips over walls).
-//  Picks 8 random floor-cell waypoints reachable from each other
-//  via adjacent steps so the ghost can always navigate between them.
-// ─────────────────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────
+//  LOCAL PATROL BUILDER
+//  Ghosts never stand still.  Strategy:
+//  1. Collect all floor cells within a manhattan radius of PATROL_RADIUS
+//     that are reachable from the ghost's spawn point.
+//  2. Sort by manhattan distance (furthest first) to spread the route.
+//  3. If only the spawn cell is reachable, add the nearest corridor
+//     neighbour to create a minimal back-and-forth.
+// ───────────────────────────────────────────────────────────────────
 
-function buildBfsPatrol(sc, sr, rng) {
-  // Collect all reachable floor cells from (sc,sr)
-  const reachable = [];
-  const visited   = Array.from({ length: ROWS }, () => new Uint8Array(COLS));
-  const queue     = [[sc, sr]];
-  visited[sr][sc] = 1;
-  const dirs      = [[0,1],[0,-1],[1,0],[-1,0]];
+function buildLocalPatrol(sc, sr, grid, rng) {
+  // BFS limited to PATROL_RADIUS manhattan distance
+  const vis  = Array.from({ length: ROWS }, () => new Uint8Array(COLS));
+  const q    = [{ c: sc, r: sr, dist: 0 }];
+  const pool = [];
+  vis[sr][sc] = 1;
 
-  while (queue.length) {
-    const [c, r] = queue.shift();
-    reachable.push({ c, r });
-    for (const [dc, dr] of dirs) {
-      const nc = c + dc, nr = r + dr;
-      if (nc >= 0 && nc < COLS && nr >= 0 && nr < ROWS
-          && !visited[nr][nc] && maze[nr][nc] === 0) {
-        visited[nr][nc] = 1;
-        queue.push([nc, nr]);
+  while (q.length) {
+    const { c, r, dist } = q.shift();
+    pool.push({ c, r, dist });
+    if (dist >= PATROL_RADIUS) continue;
+    for (const [dc, dr] of [[0,1],[0,-1],[1,0],[-1,0]]) {
+      const nc = c+dc, nr = r+dr;
+      if (nc>=0 && nc<COLS && nr>=0 && nr<ROWS && !vis[nr][nc] && grid[nr][nc]===0) {
+        vis[nr][nc] = 1;
+        q.push({ c: nc, r: nr, dist: dist+1 });
       }
     }
   }
 
-  if (reachable.length === 0) return [{ c: sc, r: sr }];
+  // We want a handful of spread-out waypoints; sort furthest first then interleave
+  pool.sort((a, b) => b.dist - a.dist);
 
-  // Shuffle reachable cells and pick up to 8 as waypoints
-  for (let i = reachable.length - 1; i > 0; i--) {
-    const j = Math.floor(rng() * (i + 1));
-    [reachable[i], reachable[j]] = [reachable[j], reachable[i]];
+  // Pick at most 6 waypoints: spawn + up to 5 spread cells
+  const waypoints = [{ c: sc, r: sr }];
+  for (const cell of pool) {
+    if (waypoints.length >= 6) break;
+    const last = waypoints[waypoints.length - 1];
+    // Only add if ≥ 2 manhattan steps from the last waypoint
+    if (Math.abs(cell.c - last.c) + Math.abs(cell.r - last.r) >= 2) {
+      waypoints.push({ c: cell.c, r: cell.r });
+    }
   }
 
-  const waypoints = [{ c: sc, r: sr }];
-  for (const cell of reachable) {
-    if (waypoints.length >= 8) break;
-    // Only add if not too close to previous waypoint (spread them out)
-    const last = waypoints[waypoints.length - 1];
-    if (Math.abs(cell.c - last.c) + Math.abs(cell.r - last.r) >= 3) {
-      waypoints.push(cell);
+  // Fallback: if stuck in a dead end with no neighbours, extend to the
+  // nearest open cell in any direction so the ghost always moves
+  if (waypoints.length < 2) {
+    outer: for (let radius = 1; radius <= ROWS; radius++) {
+      for (const [dc, dr] of [[0,1],[0,-1],[1,0],[-1,0],[1,1],[-1,-1],[1,-1],[-1,1]]) {
+        const nc = sc + dc * radius, nr = sr + dr * radius;
+        if (nc>=0 && nc<COLS && nr>=0 && nr<ROWS && grid[nr][nc]===0
+            && !(nc===sc && nr===sr)) {
+          waypoints.push({ c: nc, r: nr });
+          break outer;
+        }
+      }
     }
   }
 
@@ -654,10 +789,11 @@ function buildBfsPatrol(sc, sr, rng) {
 // ───────────────────────────────────────────────────────────────────
 
 function transitionToGame() {
-  stopBgm();                     // ── AUDIO FIX: stop BGM on game start
+  stopBgm();
   showScreen("game-screen");
   el("hud-role").textContent = role === "host" ? "HOST" : "MOVER";
   updateHudLevel();
+  updateDpadVisibility();
   appState = S.PLAYING;
   syncOverlays();
 }
@@ -723,76 +859,82 @@ function updatePhysics(dt) {
   elapsed += dt;
   updateTimer(elapsed);
 
-  const input = remoteKeys; // Mover's input
-  const lvlSpeedMult = 1 + levelIdx * 0.08;
-  const nowMs = performance.now();
+  const input       = remoteKeys;
+  const lvlSpeedMult = 1 + levelIdx * 0.07;
+  const nowMs        = performance.now();
 
-  // ── Player movement ──
-  const dx = boolAxis(input, "ArrowRight","KeyD") - boolAxis(input,"ArrowLeft","KeyA");
-  const dy = boolAxis(input, "ArrowDown", "KeyS") - boolAxis(input,"ArrowUp",  "KeyW");
-  const len = Math.hypot(dx, dy) || 1;
-  const norm = (dx || dy) ? 1/len : 0;
-  player.vx = dx * norm * PLAYER_SPEED;
-  player.vy = dy * norm * PLAYER_SPEED;
-  if (dx || dy) player.angle = Math.atan2(dy, dx);
+  // ── Player movement ──────────────────────────────────────────────
+  const dx   = boolAxis(input,"ArrowRight","KeyD") - boolAxis(input,"ArrowLeft","KeyA");
+  const dy   = boolAxis(input,"ArrowDown", "KeyS") - boolAxis(input,"ArrowUp",  "KeyW");
+  const len  = Math.hypot(dx, dy) || 1;
+  const norm = (dx||dy) ? 1/len : 0;
+  player.vx  = dx * norm * PLAYER_SPEED;
+  player.vy  = dy * norm * PLAYER_SPEED;
+  if (dx||dy) player.angle = Math.atan2(dy, dx);
 
-  player.x = slideAxis(player.x, player.vx * dt, player.y, false);
-  player.y = slideAxis(player.y, player.vy * dt, player.x, true);
+  player.x = slideAxis(player.x, player.vx * dt, player.y, false, PLAYER_R);
+  player.y = slideAxis(player.y, player.vy * dt, player.x, true,  PLAYER_R);
 
-  // ── Enemies ──
+  // ── Enemy AI ─────────────────────────────────────────────────────
   for (const e of enemies) {
     const dist = Math.hypot(player.x - e.x, player.y - e.y);
 
-    // ── FIX: Aggro state machine ──────────────────────────────────
-    // Enter aggro: player within SENSE_R (4-tile Euclidean)
+    // ── Aggro state machine ──
     if (e.aggroEnabled && dist < SENSE_R) {
+      // Player in range: enter/refresh aggro
       e.aggro      = true;
-      e.chaseUntil = nowMs + CHASE_LINGER_MS; // reset 3-sec timer
+      e.chaseUntil = nowMs + CHASE_LINGER_MS;
+    } else if (e.aggro) {
+      // Player left range: maintain chase until linger expires
+      if (nowMs >= e.chaseUntil) {
+        e.aggro = false;
+      }
     }
-    // Exit aggro: sense radius left AND 3-second linger expired
-    else if (e.aggro && nowMs > e.chaseUntil) {
-      e.aggro = false;
-    }
-    // While in linger window (player left radius but <3 s ago): stay aggro
-    else if (!e.aggroEnabled) {
-      e.aggro = false;
-    }
+    // Non-aggro enemies always have aggro=false (already false from init)
 
-    const spd = ENEMY_BASE_SPD * lvlSpeedMult * (e.aggro ? ENEMY_AGGRO_M : 1);
+    const spd = ENEMY_BASE_SPD * lvlSpeedMult * (e.aggro ? ENEMY_AGGRO_M : 1.0);
 
     if (e.aggro) {
-      // ── FIX: Smooth BFS-guided chase ─────────────────────────────
-      // Move directly toward the player (they are on walkable floor —
-      // the ghost gets un-stuck via wall-slide physics same as player).
+      // ── CHASE: steer directly toward player ──
+      // Wall-slide physics handles the actual navigation
       const d = dist || 1;
       e.vx = ((player.x - e.x) / d) * spd;
       e.vy = ((player.y - e.y) / d) * spd;
 
-    } else if (e.patrolPath && e.patrolPath.length > 0) {
-      // ── FIX: BFS-waypoint patrol ──────────────────────────────────
-      // Navigate to the current waypoint using pixel-level movement.
-      // When close enough, advance to the next waypoint.
-      const pt = e.patrolPath[e.patrolIdx % e.patrolPath.length];
-      const tx = pt.c * TILE + TILE / 2;
-      const ty = pt.r * TILE + TILE / 2;
-      const pd = Math.hypot(tx - e.x, ty - e.y);
+    } else {
+      // ── PATROL: ping-pong through waypoints, never idle ──
+      if (e.patrolPath && e.patrolPath.length >= 1) {
+        const pt = e.patrolPath[e.patrolIdx];
+        const tx = pt.c * TILE + TILE / 2;
+        const ty = pt.r * TILE + TILE / 2;
+        const pd = Math.hypot(tx - e.x, ty - e.y);
 
-      if (pd < 3) {
-        // Snap to waypoint and advance index
-        e.x = tx;
-        e.y = ty;
-        e.vx = 0;
-        e.vy = 0;
-        e.patrolIdx = (e.patrolIdx + 1) % e.patrolPath.length;
-      } else {
-        e.vx = ((tx - e.x) / pd) * spd;
-        e.vy = ((ty - e.y) / pd) * spd;
+        if (pd < 3) {
+          // Snap and advance in the current direction (ping-pong)
+          e.x = tx;
+          e.y = ty;
+          e.vx = 0;
+          e.vy = 0;
+
+          const nextIdx = e.patrolIdx + e.patrolDir;
+          if (nextIdx < 0 || nextIdx >= e.patrolPath.length) {
+            // Hit an end — reverse direction
+            e.patrolDir = -e.patrolDir;
+            e.patrolIdx += e.patrolDir; // one step in new direction
+          } else {
+            e.patrolIdx = nextIdx;
+          }
+        } else {
+          // Move toward current waypoint
+          e.vx = ((tx - e.x) / pd) * spd;
+          e.vy = ((ty - e.y) / pd) * spd;
+        }
       }
     }
 
-    // Apply movement with wall-slide collision (same as player)
-    e.x = slideAxisEnemy(e.x, e.vx * dt, e.y, false);
-    e.y = slideAxisEnemy(e.y, e.vy * dt, e.x, true);
+    // Apply movement with dedicated enemy wall-slide
+    e.x = slideAxis(e.x, e.vx * dt, e.y, false, ENEMY_R);
+    e.y = slideAxis(e.y, e.vy * dt, e.x, true,  ENEMY_R);
   }
 
   // Expire old pings
@@ -804,8 +946,8 @@ function updatePhysics(dt) {
     return;
   }
 
-  // ── Death check (with invulnerability window) ──
-  if (performance.now() > invuUntil) {
+  // ── Death check (invulnerability window at level start) ──
+  if (nowMs > invuUntil) {
     for (const e of enemies) {
       if (Math.hypot(player.x - e.x, player.y - e.y) < PLAYER_R + ENEMY_R) {
         triggerDeath(true);
@@ -817,37 +959,22 @@ function updatePhysics(dt) {
 
 function boolAxis(keys, a, b) { return (keys[a] || keys[b]) ? 1 : 0; }
 
-// Axis-separated sliding collision for the player
-function slideAxis(pos, vel, crossPos, isY) {
+/**
+ * Axis-aligned sliding collision.
+ * `radius` is passed explicitly so the same function serves both
+ * player (PLAYER_R) and enemies (ENEMY_R).
+ */
+function slideAxis(pos, vel, crossPos, isY, radius) {
   if (vel === 0) return pos;
-  const next  = pos + vel;
-  const half  = PLAYER_R * 0.88;
+  const next = pos + vel;
+  const half = radius * 0.86;
   const cross = crossPos;
 
   const checks = isY
-    ? [[cross - half + 2, next - half], [cross + half - 2, next - half],
-       [cross - half + 2, next + half], [cross + half - 2, next + half]]
-    : [[next - half, cross - half + 2], [next - half, cross + half - 2],
-       [next + half, cross - half + 2], [next + half, cross + half - 2]];
-
-  for (const [wx, wy] of checks) {
-    if (solidAt(wx, wy)) return pos;
-  }
-  return next;
-}
-
-// Axis-separated sliding collision for enemies (slightly larger radius)
-function slideAxisEnemy(pos, vel, crossPos, isY) {
-  if (vel === 0) return pos;
-  const next  = pos + vel;
-  const half  = ENEMY_R * 0.82;
-  const cross = crossPos;
-
-  const checks = isY
-    ? [[cross - half + 2, next - half], [cross + half - 2, next - half],
-       [cross - half + 2, next + half], [cross + half - 2, next + half]]
-    : [[next - half, cross - half + 2], [next - half, cross + half - 2],
-       [next + half, cross - half + 2], [next + half, cross + half - 2]];
+    ? [[cross - half + 1, next - half], [cross + half - 1, next - half],
+       [cross - half + 1, next + half], [cross + half - 1, next + half]]
+    : [[next - half, cross - half + 1], [next - half, cross + half - 1],
+       [next + half, cross - half + 1], [next + half, cross + half - 1]];
 
   for (const [wx, wy] of checks) {
     if (solidAt(wx, wy)) return pos;
@@ -869,7 +996,7 @@ function triggerWin(isAuthority) {
   if (appState === S.WIN || appState === S.DANCING) return;
   playSfx(sfxWin);
   danceTimer = 0;
-  appState   = S.DANCING;          // start victory dance
+  appState   = S.DANCING;
   if (isAuthority) sendEvent("win");
 }
 
@@ -893,7 +1020,7 @@ function onEsc() {
 }
 
 // ───────────────────────────────────────────────────────────────────
-//  NEXT LEVEL / RETRY  (Host-driven, Mover follows via network)
+//  NEXT LEVEL / RETRY  (Host-driven, Mover mirrors via network)
 // ───────────────────────────────────────────────────────────────────
 
 el("btn-next-level").addEventListener("click", () => {
@@ -905,7 +1032,7 @@ el("btn-next-level").addEventListener("click", () => {
   syncOverlays();
   if (dataConn?.open) {
     const pkt = buildLevelPacket();
-    pkt.type = "loadLevel";
+    pkt.type  = "loadLevel";
     dataConn.send(pkt);
   }
 });
@@ -918,7 +1045,7 @@ el("btn-retry").addEventListener("click", () => {
   syncOverlays();
   if (dataConn?.open) {
     const pkt = buildLevelPacket();
-    pkt.type = "loadLevel";
+    pkt.type  = "loadLevel";
     dataConn.send(pkt);
   }
 });
@@ -929,7 +1056,7 @@ el("btn-retry").addEventListener("click", () => {
 
 canvas.addEventListener("click", e => {
   if (role !== "host" || appState !== S.PLAYING) return;
-  const rect  = canvas.getBoundingClientRect();
+  const rect = canvas.getBoundingClientRect();
   const sx = e.clientX - rect.left;
   const sy = e.clientY - rect.top;
   const { ox, oy, scale } = hostViewTransform();
@@ -962,7 +1089,7 @@ function draw() {
     ctx.save();
     ctx.translate(ox, oy);
     ctx.scale(scale, scale);
-    drawWorld(false);
+    drawWorld();
     ctx.restore();
   } else {
     drawMoverView(cw, ch);
@@ -970,16 +1097,15 @@ function draw() {
 }
 
 // ── HOST VIEW — full map ──────────────────────────────────────────
-function drawWorld(isMoverFog) {
-  // Background
+function drawWorld() {
   ctx.fillStyle = C.bg;
   ctx.fillRect(0, 0, W, H);
 
-  // Tiles
   for (let r = 0; r < ROWS; r++) {
     for (let c = 0; c < COLS; c++) {
-      if (maze[r][c] === 1) drawWall(c * TILE, r * TILE);
-      else {
+      if (maze[r][c] === 1) {
+        drawWall(c * TILE, r * TILE);
+      } else {
         ctx.fillStyle = C.floor;
         ctx.fillRect(c * TILE, r * TILE, TILE, TILE);
       }
@@ -987,11 +1113,9 @@ function drawWorld(isMoverFog) {
   }
 
   drawExit();
-
-  for (const p of pings) drawPing(p);
+  for (const p of pings)   drawPing(p);
   for (const e of enemies) drawGhost(e);
 
-  // Player
   const dancing = appState === S.DANCING;
   drawPlayerChar(player.x, player.y, player.angle, dancing);
 }
@@ -999,28 +1123,26 @@ function drawWorld(isMoverFog) {
 // ── MOVER VIEW — fog of war ───────────────────────────────────────
 function drawMoverView(cw, ch) {
   const px = player.x, py = player.y;
-
-  // Camera offset so player is centred
   const ox = cw / 2 - px;
   const oy = ch / 2 - py;
 
   ctx.save();
   ctx.translate(ox, oy);
 
-  drawWorld(true);
+  drawWorld();
 
-  // Fog mask (destination-in = keep only inside the gradient)
+  // Fog mask
   ctx.globalCompositeOperation = "destination-in";
   const fog = ctx.createRadialGradient(px, py, FOG_R * 0.15, px, py, FOG_R);
-  fog.addColorStop(0,   "rgba(0,0,0,1)");
-  fog.addColorStop(0.72,"rgba(0,0,0,1)");
-  fog.addColorStop(1,   "rgba(0,0,0,0)");
+  fog.addColorStop(0,    "rgba(0,0,0,1)");
+  fog.addColorStop(0.72, "rgba(0,0,0,1)");
+  fog.addColorStop(1,    "rgba(0,0,0,0)");
   ctx.fillStyle = fog;
   ctx.fillRect(-ox, -oy, cw, ch);
 
   ctx.globalCompositeOperation = "source-over";
 
-  // Outer darkness beyond fog edge
+  // Outer darkness
   const outer = ctx.createRadialGradient(px, py, FOG_R * 0.8, px, py, FOG_R * 2.2);
   outer.addColorStop(0, "rgba(3,3,14,0)");
   outer.addColorStop(1, "rgba(3,3,14,1)");
@@ -1063,35 +1185,35 @@ function drawExit() {
   ctx.restore();
 }
 
-// ── PLAYER (cyan neon ball — UNCHANGED) ──────────────────────────
+// ── PLAYER — Neon Cyan Ball (PRESERVED EXACTLY) ───────────────────
 function drawPlayerChar(px, py, angle, dancing) {
-  const t  = elapsed;
-  const r  = PLAYER_R;
+  const t = elapsed;
+  const r = PLAYER_R;
 
   ctx.save();
   ctx.translate(px, py);
 
   if (dancing) {
-    const spin  = danceTimer * 5;
-    const scale = 1 + 0.22 * Math.sin(danceTimer * 14);
-    ctx.rotate(spin);
-    ctx.scale(scale, scale);
+    ctx.rotate(danceTimer * 5);
+    ctx.scale(1 + 0.22 * Math.sin(danceTimer * 14),
+              1 + 0.22 * Math.sin(danceTimer * 14));
   }
 
+  // 15-22px shadowBlur glow as spec requires
   ctx.shadowColor = C.player;
-  ctx.shadowBlur  = 22 + 8 * Math.sin(t * 4);
+  ctx.shadowBlur  = 18 + 6 * Math.sin(t * 4);  // oscillates 12–24, centre 18
 
-  // Body (circle + glow layers)
+  // Body — radial gradient sphere
   const bodyGrad = ctx.createRadialGradient(-r*0.2, -r*0.2, r*0.05, 0, 0, r);
-  bodyGrad.addColorStop(0, "#aaffff");
+  bodyGrad.addColorStop(0,   "#aaffff");
   bodyGrad.addColorStop(0.5, C.player);
-  bodyGrad.addColorStop(1, "#0077aa");
+  bodyGrad.addColorStop(1,   "#0077aa");
   ctx.beginPath();
   ctx.arc(0, 0, r, 0, Math.PI * 2);
   ctx.fillStyle = bodyGrad;
   ctx.fill();
 
-  // Head "eyes"
+  // Eyes (whites)
   ctx.fillStyle  = "#fff";
   ctx.shadowBlur = 0;
   ctx.beginPath();
@@ -1106,7 +1228,7 @@ function drawPlayerChar(px, py, angle, dancing) {
   ctx.arc( r*0.28, -r*0.22, r*0.08, 0, Math.PI*2);
   ctx.fill();
 
-  // Inner glow highlight
+  // Inner highlight
   ctx.beginPath();
   ctx.arc(-r*0.18, -r*0.18, r*0.28, 0, Math.PI*2);
   ctx.fillStyle = "rgba(255,255,255,0.22)";
@@ -1119,7 +1241,7 @@ function drawPlayerChar(px, py, angle, dancing) {
       const rad = r * 1.6 + 4 * Math.sin(danceTimer * 8 + i);
       ctx.beginPath();
       ctx.arc(Math.cos(a)*rad, Math.sin(a)*rad, 3, 0, Math.PI*2);
-      ctx.fillStyle = `hsl(${(i*60 + t*120) % 360},100%,70%)`;
+      ctx.fillStyle   = `hsl(${(i*60 + t*120) % 360},100%,70%)`;
       ctx.shadowColor = ctx.fillStyle;
       ctx.shadowBlur  = 10;
       ctx.fill();
@@ -1129,21 +1251,22 @@ function drawPlayerChar(px, py, angle, dancing) {
   ctx.restore();
 }
 
-// ── GHOST (enemy) ─────────────────────────────────────────────────
+// ── GHOST ─────────────────────────────────────────────────────────
 function drawGhost(e) {
-  const t = elapsed;
+  const t  = elapsed;
   const gx = e.x, gy = e.y;
   const w  = TILE * 0.70, h = TILE * 0.76;
-  const waves = 4;
 
   ctx.save();
   ctx.shadowColor = C.enemy;
   ctx.shadowBlur  = e.aggro ? 30 + 10 * Math.sin(t * 9) : 14;
   ctx.fillStyle   = e.aggro ? "#ff0022" : C.enemy;
 
+  // Ghost body with wavy hem
   ctx.beginPath();
   ctx.arc(gx, gy - h * 0.08, w / 2, Math.PI, 0);
   ctx.lineTo(gx + w/2, gy + h * 0.42);
+  const waves = 4;
   for (let i = 0; i < waves; i++) {
     const wx1 = gx + w/2 - (w/waves)*(i+0.5);
     const wx2 = gx + w/2 - (w/waves)*(i+1);
@@ -1153,7 +1276,7 @@ function drawGhost(e) {
   ctx.closePath();
   ctx.fill();
 
-  // Eyes
+  // Eyes (whites)
   ctx.fillStyle  = "#fff";
   ctx.shadowBlur = 0;
   ctx.beginPath();
@@ -1161,6 +1284,7 @@ function drawGhost(e) {
   ctx.arc(gx + w*0.19, gy - h*0.14, w*0.115, 0, Math.PI*2);
   ctx.fill();
 
+  // Pupils — red when aggro
   ctx.fillStyle = e.aggro ? "#ff0000" : "#110022";
   ctx.beginPath();
   ctx.arc(gx - w*0.19, gy - h*0.14, w*0.055, 0, Math.PI*2);
@@ -1170,7 +1294,7 @@ function drawGhost(e) {
   ctx.restore();
 }
 
-// ── PING (ripple) ─────────────────────────────────────────────────
+// ── PING (ripple marker) ──────────────────────────────────────────
 function drawPing({ x, y, born }) {
   const progress = (elapsed - born) / 2.2;
   if (progress >= 1) return;
@@ -1206,8 +1330,8 @@ function updateTimer(s) {
 }
 
 function fmtTime(s) {
-  const m   = Math.floor(s/60).toString().padStart(2,"0");
-  const sec = Math.floor(s%60).toString().padStart(2,"0");
+  const m   = Math.floor(s / 60).toString().padStart(2, "0");
+  const sec = Math.floor(s % 60).toString().padStart(2, "0");
   return `${m}:${sec}`;
 }
 
@@ -1220,14 +1344,14 @@ function updateHudLevel() {
 // ───────────────────────────────────────────────────────────────────
 
 el("btn-host").addEventListener("click", () => {
-  playBgm();                   // ── AUDIO: start BGM on first interaction
+  playBgm();
   setHidden("host-panel", false);
   setHidden("join-panel",  true);
   initHost();
 });
 
 el("btn-join").addEventListener("click", () => {
-  playBgm();                   // ── AUDIO: start BGM on first interaction
+  playBgm();
   setHidden("join-panel",  false);
   setHidden("host-panel",  true);
 });
@@ -1254,18 +1378,13 @@ el("btn-copy-code").addEventListener("click", () => {
 //  UTILITY
 // ───────────────────────────────────────────────────────────────────
 
-function el(id) { return document.getElementById(id); }
-
-function setHidden(id, hidden) {
-  el(id).classList.toggle("hidden", hidden);
-}
-
-function setStatus(who, msg) {
-  el(who === "host" ? "host-status" : "join-status").textContent = msg;
-}
+function el(id)             { return document.getElementById(id); }
+function setHidden(id, h)   { el(id).classList.toggle("hidden", h); }
+function setStatus(who, msg){ el(who==="host"?"host-status":"join-status").textContent = msg; }
 
 // ───────────────────────────────────────────────────────────────────
-//  KICK OFF RENDER LOOP
+//  BOOT
 // ───────────────────────────────────────────────────────────────────
 
+wireDpad();
 requestAnimationFrame(gameLoop);

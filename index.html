@@ -114,6 +114,21 @@
       <span class="vbadge-dot"></span>VOICE LIVE
     </div>
 
+    <!-- ╔══════════════════════════════════════════════╗
+         ║     MOBILE D-PAD  (Mover only, touch only)   ║
+         ║  Shown via JS when role=mover on touch device ║
+         ╚══════════════════════════════════════════════╝ -->
+    <div id="dpad" class="dpad hidden">
+      <!-- Row 1: Up -->
+      <button class="dpad-btn dpad-up"    data-key="ArrowUp"    aria-label="Up">▲</button>
+      <!-- Row 2: Left · Center · Right -->
+      <button class="dpad-btn dpad-left"  data-key="ArrowLeft"  aria-label="Left">◀</button>
+      <div    class="dpad-center-pip"></div>
+      <button class="dpad-btn dpad-right" data-key="ArrowRight" aria-label="Right">▶</button>
+      <!-- Row 3: Down -->
+      <button class="dpad-btn dpad-down"  data-key="ArrowDown"  aria-label="Down">▼</button>
+    </div>
+
     <!-- Pause Overlay -->
     <div id="ov-pause" class="overlay hidden">
       <div class="ov-box">

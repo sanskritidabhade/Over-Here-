@@ -465,6 +465,65 @@ html, body {
   animation: blink 1s ease-in-out infinite;
 }
 
+/* ═══════════════════════════════════════════════════
+   MOBILE D-PAD
+   Grid layout: 3 columns × 3 rows
+   Centre cell is a cosmetic pip (no button).
+   Hidden by default; JS reveals it for touch/mover.
+═══════════════════════════════════════════════════ */
+.dpad {
+  position: absolute;
+  bottom: 28px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 15;
+
+  display: grid;
+  grid-template-columns: repeat(3, 58px);
+  grid-template-rows:    repeat(3, 58px);
+  gap: 4px;
+
+  /* pointer-events handled per-button */
+  touch-action: none;
+  user-select: none;
+}
+.dpad.hidden { display: none !important; }
+
+/* Position each button in the grid */
+.dpad-up     { grid-column: 2; grid-row: 1; }
+.dpad-left   { grid-column: 1; grid-row: 2; }
+.dpad-center-pip { grid-column: 2; grid-row: 2;
+  background: rgba(0,245,255,0.06);
+  border-radius: 50%;
+  border: 1px solid rgba(0,245,255,0.15);
+}
+.dpad-right  { grid-column: 3; grid-row: 2; }
+.dpad-down   { grid-column: 2; grid-row: 3; }
+
+/* Shared button style */
+.dpad-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 245, 255, 0.08);
+  border: 2px solid rgba(0, 245, 255, 0.45);
+  border-radius: 10px;
+  color: var(--white);
+  font-size: 20px;
+  text-shadow: var(--tshadow);
+  cursor: pointer;
+  /* no outline/tap-highlight on mobile */
+  -webkit-tap-highlight-color: transparent;
+  outline: none;
+  transition: background 0.1s, box-shadow 0.1s, transform 0.08s;
+}
+.dpad-btn:active,
+.dpad-btn.pressed {
+  background: rgba(0, 245, 255, 0.28);
+  box-shadow: 0 0 18px rgba(0, 245, 255, 0.55);
+  transform: scale(0.91);
+}
+
 /* ── Overlays ── */
 .overlay {
   position: absolute; inset: 0;
