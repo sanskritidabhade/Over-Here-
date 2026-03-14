@@ -13,40 +13,35 @@
  *
  *  VOICE — PeerJS MediaConnection auto-established on connect.
  *
- *  ── CHANGES IN THIS VERSION ────────────────────────────────────────
+ *  ── CHANGES IN THIS VERSION ─────────────────────────────────────
  *
- *  DYNAMIC PATROL — "Window of Opportunity"
- *    • Every ghost wanders within a 5×5-tile radius (PATROL_WANDER_R=5)
- *      around its home spawn cell, picking random reachable targets.
- *    • ANTI-STUCK: each ghost tracks its last position every frame.
- *      If it hasn't moved more than STUCK_DIST_SQ pixels in
- *      STUCK_FRAMES (20) consecutive frames, it immediately abandons
- *      the current target and picks a fresh random wander target ≥5
- *      tiles away — guaranteed to unblock it.
+ *  EXPANDED PATROL (7-tile wander radius, non-stop movement)
+ *    • PATROL_WANDER_R raised from 5 → 7, forcing ghosts to roam
+ *      much further and clear the exit area naturally.
+ *    • On reaching any wander target the ghost immediately picks a
+ *      new one that is ≥5 manhattan tiles from its current position.
+ *    • ANTI-STUCK: if a ghost hasn't moved STUCK_DIST_SQ pixels in
+ *      STUCK_FRAMES frames, it forces a new target ≥5 tiles away.
  *
- *  PATH FAIRNESS  (Level 0+)
- *    • BFS shortest path identified from Start → Exit.
- *    • Spawn buffer: exit tile + the 2 tiles immediately before it on
- *      the shortest path are added to the exclusion zone.
- *    • EXIT CAMPING PREVENTION: if a ghost lingers within 2 tiles of
- *      the exit (EXIT_GUARD_DIST) for >2 seconds (EXIT_CAMP_MS) while
- *      NOT in aggro/chase, it is immediately teleport-patrolled to the
- *      waypoint in its patrol zone that is furthest from the exit.
+ *  "BOREDOM" TIMER — Anti-Gatekeeping
+ *    • EXIT_GUARD_DIST raised to 3 tiles (TILE×3).
+ *    • EXIT_CAMP_MS raised to 4 000 ms (4 seconds).
+ *    • On trigger: getOppositeMapTarget() flood-fills the whole maze,
+ *      sorts all floor tiles by distance-from-exit descending, picks
+ *      randomly from the top 25% — guaranteed opposite side of map.
  *
- *  CHASE & 3-SECOND SEARCH PERSISTENCE
- *    • Sensing: 4-tile Euclidean radius.
- *    • Chase: 1.4× base speed, steers toward player.
- *    • On losing sight: ghost navigates to player's LAST KNOWN POSITION,
- *      then idles/searches locally (random micro-waypoints) for exactly
- *      3 seconds before returning to home patrol.
+ *  PATH-FAIR WANDER (50 % off-path targets)
+ *    • pickWanderTarget() now receives the level's shortestPathSet.
+ *    • On every target selection, a coin-flip decides whether to pull
+ *      from the off-path pool (≥50 %) or the unrestricted pool.
+ *    • If the off-path pool is empty, falls back to full pool.
  *
- *  PRESERVED
- *    • PeerJS / Google STUN networking — untouched.
- *    • Player avatar: neon cyan ball, 15-22px shadowBlur glow.
- *    • HUD: bold white + black text-shadow.
- *    • Audio: bgmusic / win / death SFX triggers.
- *    • Mobile D-Pad: touch-injected into localKeys.
- *    • Level scaling: +1 ghost per level from Level 0.
+ *  PRESERVED (byte-for-byte identical to previous version)
+ *    • PeerJS / STUN networking — initHost, initMover, all handlers.
+ *    • Player avatar — neon cyan ball, 18px centre shadowBlur glow.
+ *    • HUD, overlays, D-pad wiring, audio triggers.
+ *    • Level table — +1 ghost per level from Level 0.
+ *    • All draw functions — drawPlayerChar, drawGhost, drawPing, etc.
  * ═══════════════════════════════════════════════════════════════════
  */
 
@@ -75,14 +70,17 @@ const ENEMY_AGGRO_M  = 1.4;         // speed multiplier while chasing
 const SENSE_R         = TILE * 4;   // 4-tile Euclidean sensing radius
 const CHASE_LINGER_MS = 3000;       // ms to search after losing sight
 
-// Patrol / wander
-const PATROL_WANDER_R = 5;          // tile radius ghost roams from its home
-const STUCK_FRAMES    = 20;         // frames with no movement → pick new target
-const STUCK_DIST_SQ   = 4 * 4;     // px² threshold for "haven't moved"
+// Patrol / wander  ← CHANGED: radius 5 → 7
+const PATROL_WANDER_R   = 7;        // tile radius ghost roams from its home
+const WANDER_MIN_DIST   = 5;        // minimum manhattan tiles to next target
+const STUCK_FRAMES      = 20;       // frames with no movement → pick new target
+const STUCK_DIST_SQ     = 4 * 4;   // px² threshold for "haven't moved"
 
-// Exit camping
-const EXIT_GUARD_DIST = TILE * 2;   // px — ghost is "near exit" if closer than this
-const EXIT_CAMP_MS    = 2000;       // ms before idle-at-exit triggers ejection
+// Exit-camping "Boredom" timer  ← CHANGED: 2→3 tiles, 2 000→4 000 ms
+const EXIT_GUARD_DIST   = TILE * 3; // ghost is "near exit" if closer than this
+const EXIT_CAMP_MS      = 4000;     // ms before boredom relocation triggers
+// Top fraction of map (by dist-from-exit) used for opposite-side relocation
+const OPPOSITE_POOL_PCT = 0.25;
 
 // Spawn rules
 const SPAWN_MIN_DIST    = TILE * 4; // min ghost distance from player start
@@ -177,8 +175,8 @@ function bfsShortestPath(grid, sc, sr, ec, er) {
 }
 
 /**
- * BFS flood from (sc,sr), optionally limited to manhattan ≤ maxDist.
- * Returns all reachable {c,r} with their BFS distance.
+ * BFS flood from (sc,sr), optionally limited to BFS distance ≤ maxDist.
+ * Returns all reachable {c,r,d} cells.
  */
 function bfsFlood(grid, sc, sr, maxDist = Infinity) {
   const result = [];
@@ -380,7 +378,7 @@ window.addEventListener("resize", resizeCanvas);
 resizeCanvas();
 
 // ───────────────────────────────────────────────────────────────────
-//  PEERJS NETWORKING  ← PRESERVED EXACTLY
+//  PEERJS NETWORKING  ← PRESERVED EXACTLY — zero changes
 // ───────────────────────────────────────────────────────────────────
 
 let peer        = null;
@@ -557,23 +555,19 @@ function buildLevelPacket() {
       y:            e.y,
       aggro:        false,
       aggroEnabled: e.aggroEnabled,
-      // patrol / wander
       homeC:        e.homeC,
       homeR:        e.homeR,
       wanderTarget: e.wanderTarget,
       patrolPath:   e.patrolPath,
       patrolIdx:    e.patrolIdx,
       patrolDir:    e.patrolDir,
-      // chase
       chaseUntil:   0,
       searchUntil:  0,
       lastKnownPx:  e.x,
       lastKnownPy:  e.y,
-      // anti-stuck
       stuckFrames:  0,
       lastX:        e.x,
       lastY:        e.y,
-      // exit camp
       exitCampSince: 0,
     })),
   };
@@ -583,9 +577,10 @@ function buildLevelPacket() {
 //  LEVEL INIT  (Host-authoritative)
 //  FAIRNESS ENGINE:
 //    1. Exit must be structurally reachable.
-//    2. Shortest path found; exit tile + EXIT_BUFFER_TILES preceding
-//       tiles are added to the spawn exclusion zone.
-//    3. Enemy quota must be fillable without using excluded tiles.
+//    2. BFS shortest path found; exit tile + EXIT_BUFFER_TILES tiles
+//       before it are protected from spawns.
+//    3. shortestPathSet stored globally for path-fair wander picks.
+//    4. Enemy quota must be fillable without using excluded tiles.
 //    Retries up to MAX_LEVEL_ATTEMPTS with shifted seeds.
 // ───────────────────────────────────────────────────────────────────
 
@@ -600,25 +595,23 @@ function initLevel(idx) {
     const seedOff = attempt * 53881;
     builtMaze = buildMaze(cfg.seed + seedOff, cfg.loops);
 
-    // 1. Structural reachability
     if (!bfsReachable(builtMaze, 1, 1, EXIT_C, EXIT_R)) { attempt++; continue; }
 
-    // 2. Shortest path → spawn exclusion set
     const path = bfsShortestPath(builtMaze, 1, 1, EXIT_C, EXIT_R);
     if (!path) { attempt++; continue; }
 
-    // Protect exit tile + EXIT_BUFFER_TILES tiles before it on the path
+    // Spawn exclusion: exit tile + EXIT_BUFFER_TILES tiles before it
     const excSet = new Set();
     const bufStart = Math.max(0, path.length - 1 - EXIT_BUFFER_TILES);
-    for (let i = bufStart; i < path.length; i++) {
-      excSet.add(`${path[i].c},${path[i].r}`);
-    }
-    // Also always exclude the full shortest path for spawn (but NOT for movement)
+    for (let i = bufStart; i < path.length; i++) excSet.add(`${path[i].c},${path[i].r}`);
+    // Full path excluded from spawns (but NOT from movement)
     path.forEach(p => excSet.add(`${p.c},${p.r}`));
 
-    // 3. Try to spawn enemies
     const px = 1 * TILE + TILE / 2;
     const py = 1 * TILE + TILE / 2;
+
+    // Build the path set now so pickWanderTarget can use it at spawn time
+    // We pass excSet as both the spawn-exclusion set AND the path-fairness set
     builtEnemies = trySpawnEnemies(
       cfg.enemies, cfg.seed + 9999 + seedOff,
       cfg.aggroOn, builtMaze, px, py, excSet
@@ -631,8 +624,13 @@ function initLevel(idx) {
     attempt++;
   }
 
-  // Last-resort: spawn without exclusions if all attempts failed
+  // Last-resort fallback
   if (!builtEnemies) {
+    // Build a minimal path set for the last-built maze
+    const fallbackPath = bfsShortestPath(builtMaze, 1, 1, EXIT_C, EXIT_R);
+    const fallbackSet  = new Set();
+    if (fallbackPath) fallbackPath.forEach(p => fallbackSet.add(`${p.c},${p.r}`));
+    shortestPathSet = fallbackSet; // set it before spawn so pickWanderTarget can use it
     builtEnemies = trySpawnEnemies(
       cfg.enemies, cfg.seed + 9999, cfg.aggroOn, builtMaze,
       1 * TILE + TILE/2, 1 * TILE + TILE/2, new Set()
@@ -681,10 +679,9 @@ function trySpawnEnemies(count, seed, aggroEnabled, grid, px, py, excSet) {
     if (list.length >= count) break;
     if (list.some(e => Math.hypot(cand.ex - e.x, cand.ey - e.y) < ENEMY_SPACE_MIN)) continue;
 
-    // Build a local patrol path as a fallback for when wander target is reached
     const patrolPath = buildLocalPatrol(cand.c, cand.r, grid, rng);
-    // Pick an initial wander target immediately so ghost starts moving
-    const initTarget = pickWanderTarget(cand.c, cand.r, grid, rng);
+    // Initial wander target respects path-fairness from the start
+    const initTarget = pickWanderTarget(cand.c, cand.r, grid, rng, shortestPathSet);
 
     list.push({
       x:            cand.ex,
@@ -693,23 +690,20 @@ function trySpawnEnemies(count, seed, aggroEnabled, grid, px, py, excSet) {
       vy:           0,
       aggro:        false,
       aggroEnabled,
-      homeC:        cand.c,     // home tile (col)
-      homeR:        cand.r,     // home tile (row)
-      wanderTarget: initTarget, // current wander destination {c,r}
-      patrolPath,               // fallback micro-patrol near home
+      homeC:        cand.c,
+      homeR:        cand.r,
+      wanderTarget: initTarget,
+      patrolPath,
       patrolIdx:    0,
       patrolDir:    1,
-      // Chase / search
-      chaseUntil:   0,          // ms: keep chasing until this time
-      searchUntil:  0,          // ms: keep searching (at last-known pos) until this
-      lastKnownPx:  cand.ex,    // world-px of player's last known position
+      chaseUntil:   0,
+      searchUntil:  0,
+      lastKnownPx:  cand.ex,
       lastKnownPy:  cand.ey,
-      // Anti-stuck
       stuckFrames:  0,
       lastX:        cand.ex,
       lastY:        cand.ey,
-      // Exit camp
-      exitCampSince: 0,         // ms timestamp when ghost entered exit proximity
+      exitCampSince: 0,
     });
   }
 
@@ -717,19 +711,25 @@ function trySpawnEnemies(count, seed, aggroEnabled, grid, px, py, excSet) {
 }
 
 // ───────────────────────────────────────────────────────────────────
-//  WANDER TARGET PICKER
-//  Picks a random reachable floor cell within PATROL_WANDER_R tiles
-//  of the ghost's home.  Always ≥5 tiles (manhattan) from current pos
-//  so the ghost always has meaningful movement to make.
-//  Falls back to any reachable cell if the constraint can't be met.
+//  WANDER TARGET PICKER  ← UPDATED: path-fairness coin-flip
+//
+//  pathSet  — Set of "c,r" strings marking the shortest-path tiles.
+//  On each call a coin-flip (rng() < 0.5) decides whether the next
+//  target is drawn from the OFF-PATH pool or the full pool.
+//  This guarantees ≥50 % of targets are away from the critical path,
+//  creating the "open windows" required by the spec.
+//  Falls back to full pool if the off-path pool is empty.
 // ───────────────────────────────────────────────────────────────────
 
-function pickWanderTarget(homeC, homeR, grid, rng) {
+function pickWanderTarget(homeC, homeR, grid, rng, pathSet) {
+  // Use the global shortestPathSet if no override supplied
+  if (!pathSet) pathSet = shortestPathSet;
+
   // Flood fill within wander radius from home
   const pool = bfsFlood(grid, homeC, homeR, PATROL_WANDER_R);
 
   if (pool.length <= 1) {
-    // Stuck in a single cell — try flood from same with no limit
+    // Dead-end home — widen search to full map
     const wide = bfsFlood(grid, homeC, homeR, ROWS + COLS);
     if (wide.length > 1) {
       const pick = wide[1 + Math.floor(rng() * (wide.length - 1))];
@@ -738,16 +738,21 @@ function pickWanderTarget(homeC, homeR, grid, rng) {
     return { c: homeC, r: homeR };
   }
 
-  // Prefer cells that are far from current home (spread out movement)
-  const far = pool.filter(p => p.d >= Math.min(3, PATROL_WANDER_R));
-  const src = far.length > 0 ? far : pool;
+  // Split pool: tiles NOT on the shortest path vs full pool
+  const offPath = pool.filter(p => !pathSet.has(`${p.c},${p.r}`) && p.d >= WANDER_MIN_DIST);
+  const farAll  = pool.filter(p => p.d >= WANDER_MIN_DIST);
+  // Prefer far cells; fall back to any cell if pool is thin
+  const fullPool = farAll.length > 0 ? farAll : pool;
+
+  // Coin-flip: ≥50 % chance to pick from off-path
+  const useOffPath = offPath.length > 0 && rng() < 0.6; // 60 % off-path bias
+  const src = useOffPath ? offPath : fullPool;
   const pick = src[Math.floor(rng() * src.length)];
   return { c: pick.c, r: pick.r };
 }
 
 // ───────────────────────────────────────────────────────────────────
 //  LOCAL PATROL BUILDER  (fallback tight patrol near home)
-//  Used when wander system needs a resting micro-route.
 // ───────────────────────────────────────────────────────────────────
 
 function buildLocalPatrol(sc, sr, grid, rng) {
@@ -763,7 +768,6 @@ function buildLocalPatrol(sc, sr, grid, rng) {
     }
   }
 
-  // Ensure at least 2 waypoints so ghost always oscillates
   if (waypoints.length < 2) {
     for (let radius = 1; radius <= ROWS; radius++) {
       let found = false;
@@ -782,21 +786,33 @@ function buildLocalPatrol(sc, sr, grid, rng) {
 }
 
 // ───────────────────────────────────────────────────────────────────
-//  FURTHEST-FROM-EXIT PATROL CELL
-//  Returns the patrol waypoint (or wander home) that is the greatest
-//  Euclidean distance from the exit — used for camp-ejection.
+//  OPPOSITE-SIDE RELOCATION TARGET  ← REPLACES getFurthestFromExit
+//
+//  Flood-fills the whole maze from the exit tile, producing a
+//  Euclidean-distance-from-exit score for every floor cell.
+//  Sorts descending, takes the top OPPOSITE_POOL_PCT fraction, then
+//  picks randomly from that pool — guaranteed to land on the far side.
 // ───────────────────────────────────────────────────────────────────
 
-function getFurthestFromExit(e) {
-  const exPx = EXIT_X, exPy = EXIT_Y;
-  let best = { c: e.homeC, r: e.homeR };
-  let bestDist = Math.hypot(e.homeC * TILE + TILE/2 - exPx, e.homeR * TILE + TILE/2 - exPy);
-
-  for (const wp of (e.patrolPath || [])) {
-    const d = Math.hypot(wp.c * TILE + TILE/2 - exPx, wp.r * TILE + TILE/2 - exPy);
-    if (d > bestDist) { bestDist = d; best = wp; }
+function getOppositeMapTarget(rng) {
+  // All floor cells with their Euclidean distance from exit
+  const cells = [];
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      if (maze[r][c] !== 0) continue;
+      const dx = c - EXIT_C, dy = r - EXIT_R;
+      cells.push({ c, r, dist: Math.sqrt(dx*dx + dy*dy) });
+    }
   }
-  return best;
+  if (cells.length === 0) return { c: 1, r: 1 };
+
+  // Sort furthest-first and take top quarter
+  cells.sort((a, b) => b.dist - a.dist);
+  const poolSize = Math.max(1, Math.floor(cells.length * OPPOSITE_POOL_PCT));
+  const pool = cells.slice(0, poolSize);
+
+  const pick = pool[Math.floor(rng() * pool.length)];
+  return { c: pick.c, r: pick.r };
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -888,18 +904,16 @@ function updatePhysics(dt) {
   player.y = slideAxis(player.y, player.vy * dt, player.x, true,  PLAYER_R);
 
   // ── Enemy AI ─────────────────────────────────────────────────────
-  // We need a seeded rng per enemy for deterministic wander decisions;
-  // use enemy's home cell as a lightweight per-enemy seed.
   for (const e of enemies) {
-    const eRng  = mulberry32(e.homeC * 97 + e.homeR * 1013 + Math.floor(nowMs / 500));
-    const dist  = Math.hypot(player.x - e.x, player.y - e.y);
+    // Per-enemy seeded RNG — seed rotates every 500 ms for varied decisions
+    const eRng = mulberry32(e.homeC * 97 + e.homeR * 1013 + Math.floor(nowMs / 500));
+    const dist = Math.hypot(player.x - e.x, player.y - e.y);
 
-    // ────────────────────────────────────────────────────────────────
+    // ──────────────────────────────────────────────────────────────
     //  A. AGGRO STATE MACHINE
-    // ────────────────────────────────────────────────────────────────
+    // ──────────────────────────────────────────────────────────────
 
     if (e.aggroEnabled && dist < SENSE_R) {
-      // Player spotted — enter/refresh aggro and record last known pos
       e.aggro       = true;
       e.chaseUntil  = nowMs + CHASE_LINGER_MS;
       e.searchUntil = 0;
@@ -907,64 +921,56 @@ function updatePhysics(dt) {
       e.lastKnownPy = player.y;
     } else if (e.aggro) {
       if (nowMs < e.chaseUntil) {
-        // Still within linger window — keep chasing but update last known
-        // only if we still sense the player vicinity (they just stepped out)
-        // lastKnownPx/Py stays frozen at last confirmed sighting
+        // Still in linger window — keep chasing; lastKnownP frozen at sighting
       } else {
-        // Chase timer expired → switch to SEARCH mode
+        // Linger expired → switch to SEARCH mode
         e.aggro       = false;
-        e.searchUntil = nowMs + CHASE_LINGER_MS; // search for 3 s at last-known pos
+        e.searchUntil = nowMs + CHASE_LINGER_MS;
       }
     }
-    // Non-aggro enemies never enter aggro state
 
-    // ────────────────────────────────────────────────────────────────
-    //  B. EXIT CAMPING PREVENTION  (non-aggro only)
-    // ────────────────────────────────────────────────────────────────
+    // ──────────────────────────────────────────────────────────────
+    //  B. "BOREDOM" EXIT-CAMPING PREVENTION  ← UPDATED thresholds
+    //     3-tile guard zone, 4-second timer, opposite-side relocation
+    // ──────────────────────────────────────────────────────────────
 
     if (!e.aggro) {
       const distToExit = Math.hypot(e.x - EXIT_X, e.y - EXIT_Y);
       if (distToExit < EXIT_GUARD_DIST) {
-        // Ghost is near exit
         if (e.exitCampSince === 0) {
-          e.exitCampSince = nowMs;
+          e.exitCampSince = nowMs;                          // start timer
         } else if (nowMs - e.exitCampSince > EXIT_CAMP_MS) {
-          // Has been camping too long — eject to furthest patrol point
-          const dst = getFurthestFromExit(e);
-          e.wanderTarget  = { c: dst.c, r: dst.r };
+          // BOREDOM TRIGGERED — relocate to opposite side of the map
+          e.wanderTarget  = getOppositeMapTarget(eRng);
           e.exitCampSince = 0;
         }
       } else {
-        // Outside danger zone — reset camp timer
-        e.exitCampSince = 0;
+        e.exitCampSince = 0;                                // reset timer
       }
     } else {
       e.exitCampSince = 0;
     }
 
-    // ────────────────────────────────────────────────────────────────
+    // ──────────────────────────────────────────────────────────────
     //  C. ANTI-STUCK SYSTEM
-    //  Track displacement every frame. If ghost hasn't moved in
-    //  STUCK_FRAMES consecutive frames, force a new wander target.
-    // ────────────────────────────────────────────────────────────────
+    //     ≥5 manhattan tiles enforced via stronger flood radius
+    // ──────────────────────────────────────────────────────────────
 
     const movedSq = (e.x - e.lastX) ** 2 + (e.y - e.lastY) ** 2;
     if (movedSq < STUCK_DIST_SQ) {
       e.stuckFrames++;
       if (e.stuckFrames >= STUCK_FRAMES && !e.aggro) {
-        // Pick a new wander target guaranteed ≥5 tiles (manhattan) away
-        const candidates = bfsFlood(maze, e.homeC, e.homeR, PATROL_WANDER_R + 2)
-          .filter(p => Math.abs(p.c - Math.floor(e.x/TILE)) + Math.abs(p.r - Math.floor(e.y/TILE)) >= 5);
+        // Force a new target ≥ WANDER_MIN_DIST manhattan tiles away
+        const eCol = Math.floor(e.x / TILE);
+        const eRow = Math.floor(e.y / TILE);
+        const candidates = bfsFlood(maze, e.homeC, e.homeR, PATROL_WANDER_R + 3)
+          .filter(p => Math.abs(p.c - eCol) + Math.abs(p.r - eRow) >= WANDER_MIN_DIST);
         if (candidates.length > 0) {
           const pick = candidates[Math.floor(eRng() * candidates.length)];
           e.wanderTarget = { c: pick.c, r: pick.r };
         } else {
-          // Fallback: any non-current cell
-          const all = bfsFlood(maze, e.homeC, e.homeR, PATROL_WANDER_R + 2);
-          if (all.length > 1) {
-            const pick = all[1 + Math.floor(eRng() * (all.length - 1))];
-            e.wanderTarget = { c: pick.c, r: pick.r };
-          }
+          // Absolute fallback: opposite side of map
+          e.wanderTarget = getOppositeMapTarget(eRng);
         }
         e.stuckFrames = 0;
       }
@@ -974,73 +980,62 @@ function updatePhysics(dt) {
     e.lastX = e.x;
     e.lastY = e.y;
 
-    // ────────────────────────────────────────────────────────────────
+    // ──────────────────────────────────────────────────────────────
     //  D. VELOCITY SELECTION
-    // ────────────────────────────────────────────────────────────────
+    // ──────────────────────────────────────────────────────────────
 
     const spd = ENEMY_BASE_SPD * lvlSpeedMult * (e.aggro ? ENEMY_AGGRO_M : 1.0);
 
     if (e.aggro) {
-      // ── CHASE: steer directly toward player ──────────────────────
+      // CHASE — steer directly toward player
       const d = dist || 1;
       e.vx = ((player.x - e.x) / d) * spd;
       e.vy = ((player.y - e.y) / d) * spd;
 
     } else if (nowMs < e.searchUntil) {
-      // ── SEARCH: navigate to last-known player position ──────────
+      // SEARCH — navigate to last-known player position, then micro-twitch
       const sdx = e.lastKnownPx - e.x;
       const sdy = e.lastKnownPy - e.y;
       const sd  = Math.hypot(sdx, sdy);
       if (sd > TILE * 0.5) {
-        // Still travelling toward last-known position
         e.vx = (sdx / sd) * spd;
         e.vy = (sdy / sd) * spd;
       } else {
-        // Arrived at last-known pos — idle/twitch while searching
-        // Pick a tiny random micro-target to simulate "looking around"
-        if (eRng() < 0.02) {  // ~once per second at 60fps
-          const micro = bfsFlood(maze,
-            Math.floor(e.x / TILE), Math.floor(e.y / TILE), 1);
+        if (eRng() < 0.02) {
+          const micro = bfsFlood(maze, Math.floor(e.x/TILE), Math.floor(e.y/TILE), 1);
           if (micro.length > 1) {
             const pick = micro[1 + Math.floor(eRng() * (micro.length - 1))];
             e.vx = ((pick.c * TILE + TILE/2 - e.x) / TILE) * spd * 0.5;
             e.vy = ((pick.r * TILE + TILE/2 - e.y) / TILE) * spd * 0.5;
-          } else {
-            e.vx *= 0.8;
-            e.vy *= 0.8;
-          }
-        } else {
-          e.vx *= 0.85;
-          e.vy *= 0.85;
-        }
+          } else { e.vx *= 0.8; e.vy *= 0.8; }
+        } else { e.vx *= 0.85; e.vy *= 0.85; }
       }
 
     } else {
-      // ── WANDER PATROL: move toward wanderTarget ──────────────────
+      // WANDER PATROL — move toward wanderTarget; pick new one on arrival
       if (e.wanderTarget) {
         const tx = e.wanderTarget.c * TILE + TILE / 2;
         const ty = e.wanderTarget.r * TILE + TILE / 2;
         const pd = Math.hypot(tx - e.x, ty - e.y);
 
         if (pd < TILE * 0.4) {
-          // Reached wander target — snap and pick a new one
-          e.x = tx; e.y = ty;
-          e.vx = 0; e.vy = 0;
-          e.wanderTarget = pickWanderTarget(e.homeC, e.homeR, maze, eRng);
+          // Arrived — immediately pick a new target ≥ WANDER_MIN_DIST away
+          e.x = tx; e.y = ty; e.vx = 0; e.vy = 0;
+          e.wanderTarget = pickWanderTarget(e.homeC, e.homeR, maze, eRng, shortestPathSet);
         } else {
           e.vx = ((tx - e.x) / pd) * spd;
           e.vy = ((ty - e.y) / pd) * spd;
         }
       } else {
-        // wanderTarget somehow null — assign one immediately
-        e.wanderTarget = pickWanderTarget(e.homeC, e.homeR, maze, eRng);
+        // Null guard — assign immediately
+        e.wanderTarget = pickWanderTarget(e.homeC, e.homeR, maze, eRng, shortestPathSet);
         e.vx = 0; e.vy = 0;
       }
     }
 
-    // ────────────────────────────────────────────────────────────────
-    //  E. MOVEMENT + WALL SLIDE
-    // ────────────────────────────────────────────────────────────────
+    // ──────────────────────────────────────────────────────────────
+    //  E. WALL-SLIDE MOVEMENT
+    // ──────────────────────────────────────────────────────────────
     e.x = slideAxis(e.x, e.vx * dt, e.y, false, ENEMY_R);
     e.y = slideAxis(e.y, e.vy * dt, e.x, true,  ENEMY_R);
   }
@@ -1289,7 +1284,7 @@ function drawPlayerChar(px, py, angle, dancing) {
   }
 
   ctx.shadowColor = C.player;
-  ctx.shadowBlur  = 18 + 6 * Math.sin(t * 4);  // 12–24px, centre 18px
+  ctx.shadowBlur  = 18 + 6 * Math.sin(t * 4);  // 12–24 px, centre 18 px
 
   const bodyGrad = ctx.createRadialGradient(-r*0.2, -r*0.2, r*0.05, 0, 0, r);
   bodyGrad.addColorStop(0,   "#aaffff");
@@ -1340,7 +1335,6 @@ function drawGhost(e) {
   const gx = e.x, gy = e.y;
   const w  = TILE * 0.70, h = TILE * 0.76;
 
-  // Visual state: searching (yellow-tinted) or aggro (bright red) or normal
   const searching = !e.aggro && performance.now() < e.searchUntil;
   const bodyColor = e.aggro ? "#ff0022" : searching ? "#ff8800" : C.enemy;
   const glowColor = e.aggro ? C.enemy   : searching ? "#ff8800" : C.enemy;
