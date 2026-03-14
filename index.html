@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Over Here!</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -11,17 +11,16 @@
 </head>
 <body>
 
-  <!-- ╔═══════════════════════════════════╗
-       ║         MENU / LOBBY             ║
-       ╚═══════════════════════════════════╝ -->
-  <div id="screen-menu" class="screen active">
-    <div class="bg-grid"></div>
-    <div class="bg-scanlines"></div>
-    <div class="bg-vignette"></div>
+  <!-- ╔══════════════════════════════════════════════╗
+       ║              MENU / LOBBY SCREEN             ║
+       ╚══════════════════════════════════════════════╝ -->
+  <div id="menu-screen" class="screen active">
+    <div class="menu-grid"></div>
+    <div class="menu-scanlines"></div>
+    <div class="menu-vignette"></div>
 
     <div class="menu-wrap">
 
-      <!-- Title -->
       <header class="title-block">
         <p class="eyebrow">▸ ARCADE NETWORK ◂</p>
         <h1 class="game-title">
@@ -31,134 +30,117 @@
         <p class="subtitle">TWO-PLAYER COOPERATIVE MAZE ESCAPE</p>
       </header>
 
-      <!-- Quick Instructions -->
-      <section class="quicksteps">
-        <div class="qs-item"><span class="qs-num">1</span><span class="qs-txt">HOST clicks <em>"Host Game"</em> and copies the Room&nbsp;ID.</span></div>
-        <div class="qs-item"><span class="qs-num">2</span><span class="qs-txt">JOINER pastes the ID and clicks <em>"Join Game"</em>.</span></div>
-        <div class="qs-item"><span class="qs-num">3</span><span class="qs-txt">HOST sees the map · JOINER navigates · Voice guides the way! <strong>PLAY!</strong></span></div>
+      <!-- How-to-Play Instructions -->
+      <section class="instructions-box">
+        <p class="instructions-title">— HOW TO PLAY —</p>
+        <ol class="instructions-list">
+          <li>
+            <span class="step-num">1</span>
+            <span class="step-text"><strong>HOST</strong> clicks <em>"HOST GAME"</em> and shares their Room&nbsp;ID with their partner.</span>
+          </li>
+          <li>
+            <span class="step-num">2</span>
+            <span class="step-text"><strong>MOVER</strong> pastes the Room ID and clicks <em>"JOIN GAME"</em> to connect.</span>
+          </li>
+          <li>
+            <span class="step-num">3</span>
+            <span class="step-text"><strong>VIEWER</strong> guides the Mover via <em>Voice Chat &amp; Click Pings</em>. Reach the exit!</span>
+          </li>
+        </ol>
+        <p class="instructions-controls">WASD / ARROW KEYS TO MOVE &nbsp;·&nbsp; ESC TO PAUSE</p>
       </section>
 
-      <!-- Role buttons -->
+      <!-- Role Buttons -->
       <div class="role-row">
-        <button id="btn-host" class="role-btn btn-cyan">
-          <span class="rb-icon">👁</span>
-          <span class="rb-name">HOST GAME</span>
-          <span class="rb-sub">Viewer · Guide your partner</span>
+        <button id="btn-host" class="role-btn host-btn">
+          <span class="role-icon">👁</span>
+          <span class="role-name">HOST GAME</span>
+          <span class="role-sub">Viewer · Guide your partner</span>
         </button>
-        <span class="vs-sep">VS</span>
-        <button id="btn-join" class="role-btn btn-yellow">
-          <span class="rb-icon">🕹</span>
-          <span class="rb-name">JOIN GAME</span>
-          <span class="rb-sub">Mover · Navigate the maze</span>
+        <div class="vs-divider">VS</div>
+        <button id="btn-join" class="role-btn join-btn">
+          <span class="role-icon">🕹</span>
+          <span class="role-name">JOIN GAME</span>
+          <span class="role-sub">Mover · Navigate the maze</span>
         </button>
       </div>
 
-      <!-- Host panel -->
-      <div id="panel-host" class="conn-panel hidden">
-        <p class="panel-lbl">YOUR ROOM ID</p>
-        <div id="room-id-display" class="room-id-text">••••••••</div>
-        <p id="host-status" class="status-txt">⏳ Generating ID…</p>
-        <button id="btn-copy" class="ui-btn">COPY ID</button>
+      <!-- Host Panel -->
+      <div id="host-panel" class="connect-panel hidden">
+        <p class="panel-label">YOUR ROOM ID</p>
+        <div id="room-code-display" class="room-code">••••••••</div>
+        <p id="host-status" class="status-text">⏳ Generating ID…</p>
+        <button id="btn-copy-code" class="action-btn">COPY ID</button>
       </div>
 
-      <!-- Join panel -->
-      <div id="panel-join" class="conn-panel hidden">
-        <p class="panel-lbl">ENTER ROOM ID</p>
-        <input id="room-id-input" class="id-input" type="text"
-               maxlength="12" placeholder="PASTE ID HERE"
-               autocomplete="off" spellcheck="false" />
-        <button id="btn-connect" class="ui-btn btn-yellow-border">JOIN →</button>
-        <p id="join-status" class="status-txt"></p>
+      <!-- Join Panel -->
+      <div id="join-panel" class="connect-panel hidden">
+        <p class="panel-label">ENTER ROOM ID</p>
+        <input id="room-code-input" class="code-input" type="text" maxlength="12"
+               placeholder="PASTE ID HERE" autocomplete="off" spellcheck="false" />
+        <button id="btn-connect" class="action-btn connect-go">JOIN →</button>
+        <p id="join-status" class="status-text"></p>
       </div>
-
-      <p class="footer-note">WASD / ARROWS · ESC = PAUSE · Touch D-Pad on mobile</p>
 
     </div>
   </div>
 
 
-  <!-- ╔═══════════════════════════════════╗
-       ║          GAME SCREEN             ║
-       ╚═══════════════════════════════════╝ -->
-  <div id="screen-game" class="screen hidden">
+  <!-- ╔══════════════════════════════════════════════╗
+       ║                GAME SCREEN                   ║
+       ╚══════════════════════════════════════════════╝ -->
+  <div id="game-screen" class="screen hidden">
 
-    <canvas id="gc"></canvas>
+    <canvas id="game-canvas"></canvas>
 
     <!-- HUD -->
     <div id="hud">
-      <div class="hcell">
-        <span class="hlbl">LVL</span>
-        <span id="h-level" class="hval">1</span>
+      <div class="hud-cell">
+        <span class="hud-lbl">LVL</span>
+        <span id="hud-level" class="hud-val">1</span>
       </div>
-      <div class="hcell hcenter">
-        <span class="hlbl">TIME</span>
-        <span id="h-timer" class="hval">00:00</span>
+      <div class="hud-cell center">
+        <span class="hud-lbl">TIME</span>
+        <span id="hud-timer" class="hud-val">00:00</span>
       </div>
-      <div class="hcell hright">
-        <span class="hlbl">ROLE</span>
-        <span id="h-role" class="hval">—</span>
+      <div class="hud-cell right">
+        <span class="hud-lbl">ROLE</span>
+        <span id="hud-role" class="hud-val">—</span>
       </div>
     </div>
 
-    <!-- Voice badge -->
+    <!-- Voice Badge -->
     <div id="voice-badge" class="hidden">
-      <span class="vdot"></span>VOICE LIVE
+      <span class="vbadge-dot"></span>VOICE LIVE
     </div>
 
-    <!-- Mobile D-Pad (only shown to Mover on touch devices) -->
-    <div id="dpad" class="hidden">
-      <div class="dpad-row">
-        <button class="dpad-btn" id="dp-up">▲</button>
-      </div>
-      <div class="dpad-row dpad-mid">
-        <button class="dpad-btn" id="dp-left">◀</button>
-        <div class="dpad-center"></div>
-        <button class="dpad-btn" id="dp-right">▶</button>
-      </div>
-      <div class="dpad-row">
-        <button class="dpad-btn" id="dp-down">▼</button>
-      </div>
-    </div>
-
-    <!-- ── OVERLAYS ── -->
-
-    <!-- Pause -->
+    <!-- Pause Overlay -->
     <div id="ov-pause" class="overlay hidden">
-      <div class="ovbox">
-        <p class="ovtitle cyan">PAUSED</p>
-        <p class="ovsub">ESC TO RESUME</p>
-        <div class="ov-btns">
-          <button id="btn-resume" class="ui-btn">RESUME</button>
-          <button id="btn-leave-pause" class="ui-btn btn-red-border">LEAVE GAME</button>
-        </div>
+      <div class="ov-box">
+        <p class="ov-title cyan">PAUSED</p>
+        <p class="ov-sub">PRESS ESC TO RESUME</p>
       </div>
     </div>
 
-    <!-- Win -->
+    <!-- Win Overlay -->
     <div id="ov-win" class="overlay hidden">
-      <div class="ovbox ovwin">
-        <p class="ovtitle green">ESCAPED!</p>
-        <p id="ov-win-time" class="ovsub"></p>
-        <div class="ov-btns">
-          <button id="btn-next" class="ui-btn">NEXT LEVEL →</button>
-          <button id="btn-leave-win" class="ui-btn btn-red-border">LEAVE GAME</button>
-        </div>
+      <div class="ov-box win">
+        <p class="ov-title green">ESCAPED!</p>
+        <p id="ov-win-time" class="ov-sub"></p>
+        <button id="btn-next-level" class="action-btn" style="margin-top:22px">NEXT LEVEL →</button>
       </div>
     </div>
 
-    <!-- Death -->
+    <!-- Death Overlay -->
     <div id="ov-death" class="overlay hidden">
-      <div class="ovbox ovdeath">
-        <p class="ovtitle red">CAUGHT!</p>
-        <p class="ovsub">THE GHOST GOT YOU…</p>
-        <div class="ov-btns">
-          <button id="btn-retry" class="ui-btn">TRY AGAIN</button>
-          <button id="btn-leave-death" class="ui-btn btn-red-border">LEAVE GAME</button>
-        </div>
+      <div class="ov-box death">
+        <p class="ov-title red">CAUGHT!</p>
+        <p class="ov-sub">THE GHOST GOT YOU…</p>
+        <button id="btn-retry" class="action-btn" style="margin-top:22px">TRY AGAIN</button>
       </div>
     </div>
 
-  </div><!-- /screen-game -->
+  </div>
 
   <script type="module" src="main.js"></script>
 </body>
