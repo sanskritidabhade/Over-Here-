@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
   <title>Over Here!</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -11,9 +11,9 @@
 </head>
 <body>
 
-  <!-- ╔══════════════════════════════════╗
-       ║         MENU / LOBBY            ║
-       ╚══════════════════════════════════╝ -->
+  <!-- ╔═══════════════════════════════════╗
+       ║         MENU / LOBBY             ║
+       ╚═══════════════════════════════════╝ -->
   <div id="screen-menu" class="screen active">
     <div class="bg-grid"></div>
     <div class="bg-scanlines"></div>
@@ -31,49 +31,32 @@
         <p class="subtitle">TWO-PLAYER COOPERATIVE MAZE ESCAPE</p>
       </header>
 
-      <!-- Instructions -->
-      <section class="howto-box">
-        <p class="howto-heading">— HOW TO PLAY —</p>
-        <ol class="howto-list">
-          <li>
-            <span class="sn">1</span>
-            <span class="st"><strong>HOST</strong> clicks <em>"Host Game"</em> → copies the Room&nbsp;ID.</span>
-          </li>
-          <li>
-            <span class="sn">2</span>
-            <span class="st"><strong>MOVER</strong> pastes the ID and clicks <em>"Join Game"</em>.</span>
-          </li>
-          <li>
-            <span class="sn">3</span>
-            <span class="st"><strong>HOST</strong> waits until the Mover confirms they can see the maze.</span>
-          </li>
-          <li>
-            <span class="sn">4</span>
-            <span class="st"><strong>PLAY!</strong> Host guides via Voice &amp; Click Pings. Reach the exit!</span>
-          </li>
-        </ol>
-        <p class="howto-controls">WASD / ARROWS · ESC = PAUSE · Click map = PING</p>
+      <!-- Quick Instructions -->
+      <section class="quicksteps">
+        <div class="qs-item"><span class="qs-num">1</span><span class="qs-txt">HOST clicks <em>"Host Game"</em> and copies the Room&nbsp;ID.</span></div>
+        <div class="qs-item"><span class="qs-num">2</span><span class="qs-txt">JOINER pastes the ID and clicks <em>"Join Game"</em>.</span></div>
+        <div class="qs-item"><span class="qs-num">3</span><span class="qs-txt">HOST sees the map · JOINER navigates · Voice guides the way! <strong>PLAY!</strong></span></div>
       </section>
 
       <!-- Role buttons -->
       <div class="role-row">
         <button id="btn-host" class="role-btn btn-cyan">
-          <span class="rbicon">👁</span>
-          <span class="rbname">HOST GAME</span>
-          <span class="rbsub">Viewer · Guide your partner</span>
+          <span class="rb-icon">👁</span>
+          <span class="rb-name">HOST GAME</span>
+          <span class="rb-sub">Viewer · Guide your partner</span>
         </button>
-        <span class="vs">VS</span>
+        <span class="vs-sep">VS</span>
         <button id="btn-join" class="role-btn btn-yellow">
-          <span class="rbicon">🕹</span>
-          <span class="rbname">JOIN GAME</span>
-          <span class="rbsub">Mover · Navigate the maze</span>
+          <span class="rb-icon">🕹</span>
+          <span class="rb-name">JOIN GAME</span>
+          <span class="rb-sub">Mover · Navigate the maze</span>
         </button>
       </div>
 
       <!-- Host panel -->
       <div id="panel-host" class="conn-panel hidden">
         <p class="panel-lbl">YOUR ROOM ID</p>
-        <div id="room-id-display" class="room-id">••••••••</div>
+        <div id="room-id-display" class="room-id-text">••••••••</div>
         <p id="host-status" class="status-txt">⏳ Generating ID…</p>
         <button id="btn-copy" class="ui-btn">COPY ID</button>
       </div>
@@ -88,13 +71,15 @@
         <p id="join-status" class="status-txt"></p>
       </div>
 
-    </div><!-- /menu-wrap -->
-  </div><!-- /screen-menu -->
+      <p class="footer-note">WASD / ARROWS · ESC = PAUSE · Touch D-Pad on mobile</p>
+
+    </div>
+  </div>
 
 
-  <!-- ╔══════════════════════════════════╗
-       ║           GAME SCREEN           ║
-       ╚══════════════════════════════════╝ -->
+  <!-- ╔═══════════════════════════════════╗
+       ║          GAME SCREEN             ║
+       ╚═══════════════════════════════════╝ -->
   <div id="screen-game" class="screen hidden">
 
     <canvas id="gc"></canvas>
@@ -118,6 +103,21 @@
     <!-- Voice badge -->
     <div id="voice-badge" class="hidden">
       <span class="vdot"></span>VOICE LIVE
+    </div>
+
+    <!-- Mobile D-Pad (only shown to Mover on touch devices) -->
+    <div id="dpad" class="hidden">
+      <div class="dpad-row">
+        <button class="dpad-btn" id="dp-up">▲</button>
+      </div>
+      <div class="dpad-row dpad-mid">
+        <button class="dpad-btn" id="dp-left">◀</button>
+        <div class="dpad-center"></div>
+        <button class="dpad-btn" id="dp-right">▶</button>
+      </div>
+      <div class="dpad-row">
+        <button class="dpad-btn" id="dp-down">▼</button>
+      </div>
     </div>
 
     <!-- ── OVERLAYS ── -->
