@@ -1,118 +1,147 @@
 <!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Over Here!</title>
-    <link rel="stylesheet" href="style.css" />
-  </head>
-  <body>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Over Here!</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=Orbitron:wght@700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
 
-    <!-- ═══════════════════════════════════════════════
-         MENU SCREEN
-    ═══════════════════════════════════════════════ -->
-    <div id="menu-screen" class="screen active">
-      <div class="menu-bg-grid"></div>
-      <div class="menu-scanlines"></div>
+  <!-- ╔══════════════════════════════════════════════╗
+       ║              MENU / LOBBY SCREEN             ║
+       ╚══════════════════════════════════════════════╝ -->
+  <div id="menu-screen" class="screen active">
+    <div class="menu-grid"></div>
+    <div class="menu-scanlines"></div>
+    <div class="menu-vignette"></div>
 
-      <div class="menu-content">
-        <div class="title-block">
-          <div class="title-eyebrow">● ARCADE NETWORK ●</div>
-          <h1 class="game-title">
-            <span class="title-over">OVER</span>
-            <span class="title-here">HERE!</span>
-          </h1>
-          <div class="title-tagline">A TWO-PLAYER COOPERATIVE MAZE ESCAPE</div>
-        </div>
+    <div class="menu-wrap">
 
-        <div class="role-selector">
-          <button id="btn-host" class="role-btn role-host">
-            <span class="role-icon">👁</span>
-            <span class="role-label">HOST</span>
-            <span class="role-desc">Viewer · Guide your partner</span>
-          </button>
-          <div class="role-divider">— VS —</div>
-          <button id="btn-join" class="role-btn role-join">
-            <span class="role-icon">🕹</span>
-            <span class="role-label">JOIN</span>
-            <span class="role-desc">Mover · Navigate the maze</span>
-          </button>
-        </div>
+      <header class="title-block">
+        <p class="eyebrow">▸ ARCADE NETWORK ◂</p>
+        <h1 class="game-title">
+          <span class="t-over">OVER</span>
+          <span class="t-here">HERE!</span>
+        </h1>
+        <p class="subtitle">TWO-PLAYER COOPERATIVE MAZE ESCAPE</p>
+      </header>
 
-        <!-- Host Panel -->
-        <div id="host-panel" class="connect-panel hidden">
-          <div class="panel-title">YOUR ROOM CODE</div>
-          <div id="room-code-display" class="room-code">••••••</div>
-          <div class="panel-status" id="host-status">⏳ Generating code…</div>
-          <button id="btn-copy-code" class="small-btn">COPY CODE</button>
-        </div>
+      <!-- How-to-Play Instructions -->
+      <section class="instructions-box">
+        <p class="instructions-title">— HOW TO PLAY —</p>
+        <ol class="instructions-list">
+          <li>
+            <span class="step-num">1</span>
+            <span class="step-text"><strong>HOST</strong> clicks <em>"HOST GAME"</em> and shares their Room&nbsp;ID with their partner.</span>
+          </li>
+          <li>
+            <span class="step-num">2</span>
+            <span class="step-text"><strong>MOVER</strong> pastes the Room ID and clicks <em>"JOIN GAME"</em> to connect.</span>
+          </li>
+          <li>
+            <span class="step-num">3</span>
+            <span class="step-text"><strong>VIEWER</strong> guides the Mover via <em>Voice Chat &amp; Click Pings</em>. Reach the exit!</span>
+          </li>
+        </ol>
+        <p class="instructions-controls">WASD / ARROW KEYS TO MOVE &nbsp;·&nbsp; ESC TO PAUSE</p>
+      </section>
 
-        <!-- Join Panel -->
-        <div id="join-panel" class="connect-panel hidden">
-          <div class="panel-title">ENTER ROOM CODE</div>
-          <input id="room-code-input" class="code-input" type="text" maxlength="8" placeholder="XXXXXXXX" autocomplete="off" spellcheck="false" />
-          <button id="btn-connect" class="connect-btn">CONNECT →</button>
-          <div class="panel-status" id="join-status"></div>
-        </div>
+      <!-- Role Buttons -->
+      <div class="role-row">
+        <button id="btn-host" class="role-btn host-btn">
+          <span class="role-icon">👁</span>
+          <span class="role-name">HOST GAME</span>
+          <span class="role-sub">Viewer · Guide your partner</span>
+        </button>
+        <div class="vs-divider">VS</div>
+        <button id="btn-join" class="role-btn join-btn">
+          <span class="role-icon">🕹</span>
+          <span class="role-name">JOIN GAME</span>
+          <span class="role-sub">Mover · Navigate the maze</span>
+        </button>
+      </div>
 
-        <div class="menu-footer">USE WASD / ARROW KEYS · ESC TO PAUSE · VOICE CHAT AUTO-ENABLED</div>
+      <!-- Host Panel -->
+      <div id="host-panel" class="connect-panel hidden">
+        <p class="panel-label">YOUR ROOM ID</p>
+        <div id="room-code-display" class="room-code">••••••••</div>
+        <p id="host-status" class="status-text">⏳ Generating ID…</p>
+        <button id="btn-copy-code" class="action-btn">COPY ID</button>
+      </div>
+
+      <!-- Join Panel -->
+      <div id="join-panel" class="connect-panel hidden">
+        <p class="panel-label">ENTER ROOM ID</p>
+        <input id="room-code-input" class="code-input" type="text" maxlength="12"
+               placeholder="PASTE ID HERE" autocomplete="off" spellcheck="false" />
+        <button id="btn-connect" class="action-btn connect-go">JOIN →</button>
+        <p id="join-status" class="status-text"></p>
+      </div>
+
+    </div>
+  </div>
+
+
+  <!-- ╔══════════════════════════════════════════════╗
+       ║                GAME SCREEN                   ║
+       ╚══════════════════════════════════════════════╝ -->
+  <div id="game-screen" class="screen hidden">
+
+    <canvas id="game-canvas"></canvas>
+
+    <!-- HUD -->
+    <div id="hud">
+      <div class="hud-cell">
+        <span class="hud-lbl">LVL</span>
+        <span id="hud-level" class="hud-val">1</span>
+      </div>
+      <div class="hud-cell center">
+        <span class="hud-lbl">TIME</span>
+        <span id="hud-timer" class="hud-val">00:00</span>
+      </div>
+      <div class="hud-cell right">
+        <span class="hud-lbl">ROLE</span>
+        <span id="hud-role" class="hud-val">—</span>
       </div>
     </div>
 
-    <!-- ═══════════════════════════════════════════════
-         GAME SCREEN
-    ═══════════════════════════════════════════════ -->
-    <div id="game-screen" class="screen hidden">
-      <canvas id="game-canvas"></canvas>
+    <!-- Voice Badge -->
+    <div id="voice-badge" class="hidden">
+      <span class="vbadge-dot"></span>VOICE LIVE
+    </div>
 
-      <!-- HUD -->
-      <div id="hud">
-        <div id="hud-left">
-          <div class="hud-label">LEVEL</div>
-          <div id="hud-level" class="hud-value">1</div>
-        </div>
-        <div id="hud-center">
-          <div class="hud-label">TIME</div>
-          <div id="hud-timer" class="hud-value">00:00</div>
-        </div>
-        <div id="hud-right">
-          <div class="hud-label">ROLE</div>
-          <div id="hud-role" class="hud-value">—</div>
-        </div>
-      </div>
-
-      <!-- Voice indicator -->
-      <div id="voice-indicator" class="hidden">
-        <span class="voice-dot"></span> VOICE LIVE
-      </div>
-
-      <!-- Pause overlay -->
-      <div id="pause-overlay" class="overlay hidden">
-        <div class="overlay-box">
-          <div class="overlay-title">PAUSED</div>
-          <div class="overlay-sub">PRESS ESC TO RESUME</div>
-        </div>
-      </div>
-
-      <!-- Win overlay -->
-      <div id="win-overlay" class="overlay hidden">
-        <div class="overlay-box win">
-          <div class="overlay-title">ESCAPED!</div>
-          <div id="win-time" class="overlay-sub"></div>
-          <button id="btn-next-level" class="connect-btn" style="margin-top:24px">NEXT LEVEL →</button>
-        </div>
-      </div>
-
-      <!-- Death overlay -->
-      <div id="death-overlay" class="overlay hidden">
-        <div class="overlay-box death">
-          <div class="overlay-title">CAUGHT!</div>
-          <div class="overlay-sub">YOU WERE SPOTTED…</div>
-          <button id="btn-retry" class="connect-btn" style="margin-top:24px">RETRY</button>
-        </div>
+    <!-- Pause Overlay -->
+    <div id="ov-pause" class="overlay hidden">
+      <div class="ov-box">
+        <p class="ov-title cyan">PAUSED</p>
+        <p class="ov-sub">PRESS ESC TO RESUME</p>
       </div>
     </div>
 
-    <script type="module" src="main.js"></script>
-  </body>
+    <!-- Win Overlay -->
+    <div id="ov-win" class="overlay hidden">
+      <div class="ov-box win">
+        <p class="ov-title green">ESCAPED!</p>
+        <p id="ov-win-time" class="ov-sub"></p>
+        <button id="btn-next-level" class="action-btn" style="margin-top:22px">NEXT LEVEL →</button>
+      </div>
+    </div>
+
+    <!-- Death Overlay -->
+    <div id="ov-death" class="overlay hidden">
+      <div class="ov-box death">
+        <p class="ov-title red">CAUGHT!</p>
+        <p class="ov-sub">THE GHOST GOT YOU…</p>
+        <button id="btn-retry" class="action-btn" style="margin-top:22px">TRY AGAIN</button>
+      </div>
+    </div>
+
+  </div>
+
+  <script type="module" src="main.js"></script>
+</body>
 </html>
